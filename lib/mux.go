@@ -11,14 +11,27 @@ import (
 	"time"
 )
 
-// mux broadcasts audio stream to subscribed clients (ie. to http servers).
+// mux broadcasts audio or video stream to subscribed clients (ie. to http servers).
 // Clients subscribe() and unsubscribe by writing to result channel.
 type mux struct {
 	sync.Mutex
 
-	clients  map[int]chan streamFrame // set of listener clients to be notified
-	result   chan broadcastResult     // clients share broadcast success-failure here
-	streamer *Streamer
+	clients   map[int]chan streamFrame // set of listener clients to be notified
+	result    chan broadcastResult     // clients share broadcast success-failure here
+	currentCT string                   // Content-Type of the currently streaming file
+	streamer  *Streamer
+}
+
+// currentContentType returns the HTTP Content-Type of the file currently
+// being streamed. It defaults to "audio/wav" before the first file starts.
+func (m *mux) currentContentType() string {
+	m.Lock()
+	ct := m.currentCT
+	m.Unlock()
+	if ct == "" {
+		return "audio/wav"
+	}
+	return ct
 }
 
 // subscribe adds ch to the set of channels to be received on by the clients when a new audio frame is available.
@@ -55,8 +68,8 @@ func (m *mux) start(s *Streamer) *mux {
 	m.clients = make(map[int]chan streamFrame)
 
 	// flow structure: fs -> nextFile -> nextFrame -> subscribed http servers -> browsers
-	nextFile := make(chan string)       // next file to be broadcast
-	nextFrame := make(chan streamFrame) // next audio frame
+	nextFile := make(chan fileEntry)    // next file to be broadcast (with its Content-Type)
+	nextFrame := make(chan streamFrame) // next audio or video chunk
 
 	// generate randomized list of files available from path
 	rand.Seed(time.Now().Unix()) // minimal randomness
@@ -85,7 +98,8 @@ func (m *mux) start(s *Streamer) *mux {
 				if !info.Mode().IsRegular() {
 					return nil
 				}
-				if !info.IsDir() && decoderForFile(info.Name()) == nil {
+				// skip files with no registered handler (audio or video)
+				if !info.IsDir() && contentTypeForFile(info.Name()) == "" {
 					return nil
 				}
 
@@ -113,7 +127,7 @@ func (m *mux) start(s *Streamer) *mux {
 			for f := range files {
 				select {
 				case <-time.After(100 * time.Millisecond): // start playing as soon as possible, but wait at least 0.1 second for shuffling
-					nextFile <- f
+					nextFile <- fileEntry{Path: f, ContentType: contentTypeForFile(f)}
 					if s.Verbose {
 						fmt.Printf("Next: %v\n", f)
 					}
@@ -132,13 +146,41 @@ func (m *mux) start(s *Streamer) *mux {
 
 			// queue shuffled files
 			for _, f := range shuffled {
-				nextFile <- f
+				nextFile <- fileEntry{Path: f, ContentType: contentTypeForFile(f)}
 				if s.Verbose {
 					fmt.Printf("Next: %v\n", f)
 				}
 			}
 		}
 	}()
+
+	// streamVideoFile pipes a video file directly to nextFrame in 64 KiB chunks.
+	// No timing is applied; the browser's media pipeline handles buffering.
+	streamVideoFile := func(filename string) {
+		f, err := os.Open(filename)
+		if err != nil {
+			if s.Debug {
+				log.Printf("Skipped %q: %v", filename, err)
+			}
+			return
+		}
+		defer f.Close()
+		if s.Verbose {
+			fmt.Printf("Now playing: %v\n", filename)
+		}
+		buf := make([]byte, 64*1024)
+		for {
+			n, err := f.Read(buf)
+			if n > 0 {
+				chunk := make([]byte, n)
+				copy(chunk, buf[:n])
+				nextFrame <- chunk
+			}
+			if err != nil {
+				break
+			}
+		}
+	}
 
 	// decodeFile decodes one audio file and sends its PCM chunks to nextFrame
 	// with appropriate pacing. It is called from separate goroutines below.
@@ -187,6 +229,9 @@ func (m *mux) start(s *Streamer) *mux {
 		if path != "-" {
 			return
 		}
+		m.Lock()
+		m.currentCT = "audio/wav"
+		m.Unlock()
 		dec := decoderForFile(".mp3") // stdin is assumed to be MP3
 		if dec == nil {
 			return
@@ -211,15 +256,22 @@ func (m *mux) start(s *Streamer) *mux {
 		}
 	}()
 
-	// file path: open, decode, normalise, and pace each queued audio file.
+	// file path: open, decode/stream, and pace each queued file.
 	go func() {
 		if path == "-" {
 			return
 		}
 		var cumwait time.Duration
 		for {
-			filename := <-nextFile
-			decodeFile(filename, &cumwait)
+			entry := <-nextFile
+			m.Lock()
+			m.currentCT = entry.ContentType
+			m.Unlock()
+			if entry.ContentType == "audio/wav" {
+				decodeFile(entry.Path, &cumwait)
+			} else {
+				streamVideoFile(entry.Path)
+			}
 		}
 	}()
 
