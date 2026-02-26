@@ -2,19 +2,13 @@
 package lib
 
 import (
-	"bufio"
 	"fmt"
-	"io"
-	"io/ioutil"
 	"log"
 	"math/rand"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 	"time"
-
-	"github.com/fgergo/mp3" // this fork was only created to have a modularized version of boringstreamer. Original: github.com/tcolgate/mp3
 )
 
 // mux broadcasts audio stream to subscribed clients (ie. to http servers).
@@ -60,9 +54,8 @@ func (m *mux) start(s *Streamer) *mux {
 	m.result = make(chan broadcastResult)
 	m.clients = make(map[int]chan streamFrame)
 
-	// flow structure: fs -> nextFile -> nextStream -> nextFrame -> subscribed http servers -> browsers
+	// flow structure: fs -> nextFile -> nextFrame -> subscribed http servers -> browsers
 	nextFile := make(chan string)       // next file to be broadcast
-	nextStream := make(chan io.Reader)  // next raw audio stream
 	nextFrame := make(chan streamFrame) // next audio frame
 
 	// generate randomized list of files available from path
@@ -92,8 +85,7 @@ func (m *mux) start(s *Streamer) *mux {
 				if !info.Mode().IsRegular() {
 					return nil
 				}
-				probably := strings.HasSuffix(strings.ToLower(info.Name()), ".mp3") // probably mp3
-				if !info.IsDir() && !probably {
+				if !info.IsDir() && decoderForFile(info.Name()) == nil {
 					return nil
 				}
 
@@ -148,76 +140,86 @@ func (m *mux) start(s *Streamer) *mux {
 		}
 	}()
 
-	// open file
-	go func() {
-		if path == "-" {
-			nextStream <- os.Stdin
+	// decodeFile decodes one audio file and sends its PCM chunks to nextFrame
+	// with appropriate pacing. It is called from separate goroutines below.
+	decodeFile := func(filename string, cumwait *time.Duration) {
+		dec := decoderForFile(filename)
+		if dec == nil {
 			return
 		}
-
-		for {
-			filename := <-nextFile
-			f, err := os.Open(filename)
-			if err != nil {
-				if s.Debug {
-					log.Printf("Skipped \"%v\", err=%v", filename, err)
-				}
-				continue
+		f, err := os.Open(filename)
+		if err != nil {
+			if s.Debug {
+				log.Printf("Skipped %q: %v", filename, err)
 			}
-			nextStream <- bufio.NewReaderSize(f, 1024*1024)
-			if s.Verbose {
-				fmt.Printf("Now playing: %v\n", filename)
+			return
+		}
+		defer f.Close()
+
+		samples, rate, ch, err := dec.Decode(f)
+		if err != nil {
+			if s.Debug {
+				log.Printf("Skipped %q: decode error: %v", filename, err)
+			}
+			return
+		}
+		if s.Verbose {
+			fmt.Printf("Now playing: %v\n", filename)
+		}
+
+		frames := chunk(normalise(samples, rate, ch), 8820)
+		for _, frame := range frames {
+			t0 := time.Now()
+			frameBytes := int16sToBytes(frame)
+			nextFrame <- frameBytes
+			// frame duration = samples / (channels * sample_rate)
+			towait := time.Duration(len(frameBytes))*time.Second/(2*2*canonRate) - time.Since(t0)
+			*cumwait += towait
+			if *cumwait > time.Second {
+				time.Sleep(*cumwait)
+				*cumwait = 0
+			}
+		}
+	}
+
+	// stdin path: decode a single MP3 stream piped to standard input.
+	go func() {
+		if path != "-" {
+			return
+		}
+		dec := decoderForFile(".mp3") // stdin is assumed to be MP3
+		if dec == nil {
+			return
+		}
+		samples, rate, ch, err := dec.Decode(os.Stdin)
+		if err != nil {
+			log.Printf("stdin decode error: %v", err)
+			return
+		}
+		var cumwait time.Duration
+		frames := chunk(normalise(samples, rate, ch), 8820)
+		for _, frame := range frames {
+			t0 := time.Now()
+			frameBytes := int16sToBytes(frame)
+			nextFrame <- frameBytes
+			towait := time.Duration(len(frameBytes))*time.Second/(2*2*canonRate) - time.Since(t0)
+			cumwait += towait
+			if cumwait > time.Second {
+				time.Sleep(cumwait)
+				cumwait = 0
 			}
 		}
 	}()
 
-	// decode stream to frames and delay for frame duration
+	// file path: open, decode, normalise, and pace each queued audio file.
 	go func() {
-		skipped := 0
-		nullwriter := new(nullWriter)
+		if path == "-" {
+			return
+		}
 		var cumwait time.Duration
 		for {
-			streamReader := <-nextStream
-			d := mp3.NewDecoder(streamReader)
-			var f mp3.Frame
-			for {
-				t0 := time.Now()
-				tmp := log.Prefix()
-				if !s.Debug {
-					log.SetOutput(nullwriter) // hack to silence mp3 debug/log output
-				} else {
-					log.SetPrefix("info: mp3 decode msg: ")
-				}
-				err := d.Decode(&f, &skipped)
-				log.SetPrefix(tmp)
-				if !s.Debug {
-					log.SetOutput(os.Stderr)
-				}
-				if err == io.EOF {
-					break
-				}
-				if err != nil {
-					if s.Debug {
-						log.Printf("Skipping frame, d.Decode() err=%v", err)
-					}
-					continue
-				}
-				buf, err := ioutil.ReadAll(f.Reader())
-				if err != nil {
-					if s.Debug {
-						log.Printf("Skipping frame, ioutil.ReadAll() err=%v", err)
-					}
-					continue
-				}
-				nextFrame <- buf
-
-				towait := f.Duration() - time.Now().Sub(t0)
-				cumwait += towait // towait can be negative -> cumwait
-				if cumwait > 1*time.Second {
-					time.Sleep(cumwait)
-					cumwait = 0
-				}
-			}
+			filename := <-nextFile
+			decodeFile(filename, &cumwait)
 		}
 	}()
 

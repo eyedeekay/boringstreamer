@@ -17,10 +17,9 @@ type streamHandler struct {
 	*mux
 }
 
-// ServeHTTP handles HTTP requests and streams mp3 audio to browsers.
-// Chrome and Firefox play mp3 audio stream directly.
-// Details: https://tools.ietf.org/html/draft-pantos-http-live-streaming-20
-// Search for "Packed Audio"
+// ServeHTTP handles HTTP requests and streams WAV audio to browsers.
+// Major browsers play a streaming WAV response natively when the data
+// chunk size is set to 0xFFFFFFFF (open-ended).
 func (sh streamHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	now := time.Now().UTC()
 	frames := make(chan streamFrame)
@@ -34,12 +33,12 @@ func (sh streamHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Date", now.Format(http.TimeFormat))
 	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Content-Type", "audio/mpeg")
+	w.Header().Set("Content-Type", "audio/wav")
 	w.Header().Set("Server", "BoringStreamer/4.0")
 
-	// some browsers need ID3 tag to identify first frame as audio media to be played
-	// minimal ID3 header to designate audio stream
-	b := []byte{0x49, 0x44, 0x33, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}
+	// Write a single WAV header with an open-ended data chunk so browsers can
+	// begin playback immediately and continue reading indefinitely.
+	b := wavHeader(44100, 2, 16)
 	_, err := io.Copy(w, bytes.NewReader(b))
 	if err == nil {
 		// broadcast mp3 stream to w
