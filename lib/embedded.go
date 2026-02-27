@@ -25,8 +25,14 @@ type Streamer struct {
 	// Debug enables additional debug logging and exposes a pprof endpoint on :6060.
 	Debug bool
 	// Path is the file-system path to scan for audio and video files
-	// (.mp3, .flac, .mp4, .webm, .avi, .mkv), or "-" to stream stdin (MP3).
+	// (.mp3, .flac, .mp4, .webm, .avi, .mkv), or "-" to stream stdin.
+	// Defaults to "." (the current working directory).
 	Path string
+	// StdinFormat specifies the audio format expected on standard input when
+	// Path is "-".  Valid values are the registered audio format extensions
+	// without the leading dot: "mp3" or "flac".  The value is case-insensitive.
+	// Defaults to "mp3".
+	StdinFormat string
 
 	server *http.Server
 }
@@ -36,7 +42,8 @@ func NewStreamer() *Streamer {
 	return &Streamer{
 		MaxConnections: 42,
 		Recursive:      true,
-		Path:           "/",
+		Path:           ".",
+		StdinFormat:    "mp3",
 	}
 }
 

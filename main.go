@@ -14,12 +14,13 @@ func main() {
 	maxConnections := flag.Int("max", 42, "set maximum number of streaming connections")
 	recursively := flag.Bool("r", true, "recursively look for music starting from path")
 	verbose := flag.Bool("v", false, "display verbose messages")
+	stdinFmt := flag.String("fmt", "mp3", "audio format read from stdin when path is \"-\" (mp3 or flac)")
 
 	flag.Usage = func() {
 		fmt.Printf("Usage: %s [flags] [path]\n", os.Args[0])
 		fmt.Println("then browse to listen. (e.g. http://localhost:4444/)")
 		fmt.Printf("%v does not follow links.\n", os.Args[0])
-		fmt.Printf("To stream from standard input: %v -\n\n", os.Args[0])
+		fmt.Printf("To stream from standard input: %v [-fmt mp3|flac] -\n\n", os.Args[0])
 		fmt.Println("flags:")
 		flag.PrintDefaults()
 	}
@@ -29,7 +30,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	path := "/"
+	path := "."
 	debug := false
 	switch len(flag.Args()) {
 	case 0:
@@ -73,6 +74,7 @@ func main() {
 		Verbose:        *verbose,
 		Debug:          debug,
 		Path:           path,
+		StdinFormat:    *stdinFmt,
 	}
 
 	if err := s.ListenAndServe(*addr); err != nil {

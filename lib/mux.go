@@ -7,6 +7,7 @@ import (
 	"math/rand"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 )
@@ -39,13 +40,19 @@ func (m *mux) currentContentType() string {
 // Returns -1, nil if too many clients are already listening.
 func (m *mux) subscribe(ch chan streamFrame) (int, chan broadcastResult) {
 	m.Lock()
-	// search for available qid
+	// Reject immediately when at or above capacity.  Using len(m.clients) makes
+	// the capacity check O(1) and handles all boundary values of MaxConnections
+	// (including 0) correctly and explicitly.
+	if m.streamer.MaxConnections <= 0 || len(m.clients) >= m.streamer.MaxConnections {
+		m.Unlock()
+		return -1, nil
+	}
+	// Find the first unused qid by sequential scan.  In the common case where
+	// clients are added and removed roughly in order this terminates quickly.
 	qid := 0
-	_, ok := m.clients[qid]
-	for ; ok; _, ok = m.clients[qid] {
-		if qid >= m.streamer.MaxConnections-1 {
-			m.Unlock()
-			return -1, nil
+	for {
+		if _, occupied := m.clients[qid]; !occupied {
+			break
 		}
 		qid++
 	}
@@ -231,10 +238,12 @@ func (m *mux) start(s *Streamer) *mux {
 		}
 	}
 
-	// stdin path: decode the MP3 stream piped to standard input once, then
-	// loop the cached frames continuously.  Looping means clients that
-	// connect after stdin has been fully consumed still receive audio,
-	// matching the behaviour of the file-streamer path.
+	// stdin path: decode the stream piped to standard input once, then loop
+	// the cached frames continuously.  Looping means clients that connect
+	// after stdin has been fully consumed still receive audio, matching the
+	// behaviour of the file-streamer path.
+	//
+	// The format is determined by Streamer.StdinFormat (default "mp3").
 	go func() {
 		if path != "-" {
 			return
@@ -242,8 +251,12 @@ func (m *mux) start(s *Streamer) *mux {
 		m.Lock()
 		m.currentCT = "audio/wav"
 		m.Unlock()
-		dec := decoderForFile(".mp3") // stdin is assumed to be MP3
+		// Normalise: strip any leading dot, lower-case, then re-add the dot so
+		// decoderForFile can match against registered extensions.
+		fmt := strings.ToLower(strings.TrimPrefix(s.StdinFormat, "."))
+		dec := decoderForFile("." + fmt)
 		if dec == nil {
+			log.Printf("stdin: unknown format %q; set a supported format via Streamer.StdinFormat (e.g. \"mp3\" or \"flac\")", s.StdinFormat)
 			return
 		}
 		samples, rate, ch, err := dec.Decode(os.Stdin)
