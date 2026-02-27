@@ -9,8 +9,8 @@ or
 
 	c:\>boringstreamer.exe
 
-Recursively looks for supported audio files starting from "/" and broadcasts on
-port 4444 for at most 42 concurrent http clients.
+Recursively looks for supported audio files starting from the current working
+directory and broadcasts on port 4444 for at most 42 concurrent http clients.
 
 Details: see -h.
 

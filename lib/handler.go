@@ -3,7 +3,6 @@ package lib
 
 import (
 	"bytes"
-	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -11,6 +10,12 @@ import (
 	"sync"
 	"time"
 )
+
+// broadcastTimeout is the maximum time allowed for io.Copy to deliver one audio
+// frame to a single HTTP client. Slow clients that exceed this limit are
+// disconnected. Declared as a package-level variable so tests can reduce it to
+// milliseconds without modifying production behaviour.
+var broadcastTimeout = 44 * time.Second
 
 // streamHandler wraps a mux to serve HTTP requests for audio streaming.
 type streamHandler struct {
@@ -51,8 +56,11 @@ func (sh streamHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	// broadcast stream to w
-	broadcastTimeout := 44 * time.Second // timeout for slow clients
-	result := make(chan error)
+	// result is buffered (capacity 1) so that the io.Copy goroutine can always
+	// send its outcome and exit, even if ServeHTTP has already returned due to
+	// a timeout. An unbuffered channel here caused a goroutine leak: the
+	// io.Copy goroutine would block on the send indefinitely after a timeout.
+	result := make(chan error, 1)
 	m := sync.Mutex{}
 	for {
 		// Use comma-ok so that a closed channel (mux cleaned up a zombie
@@ -76,7 +84,7 @@ func (sh streamHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 			br <- broadcastResult{qid, nil} // frame streamed, no error, send ack
 		case <-time.After(broadcastTimeout): // it's an error if io.Copy() is not finished within broadcastTimeout, ServeHTTP should exit
-			err = errors.New(fmt.Sprintf("timeout: %v", broadcastTimeout))
+			err = fmt.Errorf("timeout: %v", broadcastTimeout)
 		}
 
 		if err != nil {
