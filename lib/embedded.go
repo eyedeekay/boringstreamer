@@ -17,13 +17,15 @@ import (
 type Streamer struct {
 	// MaxConnections is the maximum number of simultaneous streaming clients.
 	MaxConnections int
-	// Recursive controls whether subdirectories are scanned for mp3 files.
+	// Recursive controls whether subdirectories are scanned for audio and video files.
+	// When false only the top-level directory is searched; subdirectories are skipped.
 	Recursive bool
 	// Verbose enables informational log output.
 	Verbose bool
 	// Debug enables additional debug logging and exposes a pprof endpoint on :6060.
 	Debug bool
-	// Path is the file-system path to scan for mp3 files, or "-" to stream stdin.
+	// Path is the file-system path to scan for audio and video files
+	// (.mp3, .flac, .mp4, .webm, .avi, .mkv), or "-" to stream stdin (MP3).
 	Path string
 
 	server *http.Server

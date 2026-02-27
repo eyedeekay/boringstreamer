@@ -1,38 +1,29 @@
 Sensible defaults -> no configuration files.
 
-# Boringstreamer streams mp3 files via http
+# Boringstreamer streams audio and video files via HTTP
 
-Boringstreamer looks for mp3 files and broadcasts via http.
-Browse to listen (e.g. http://localhost:4444/)
+Boringstreamer scans a directory for audio and video files and broadcasts them
+via HTTP live streaming. Browse to listen or watch (e.g. http://localhost:4444/)
+
+Supported formats: `.mp3`, `.flac`, `.mp4`, `.webm`, `.avi`, `.mkv`
+
+All audio (MP3 and FLAC) is normalised to a single continuous 44100 Hz stereo
+WAV stream, so mixed sample rates and mono/stereo files play back seamlessly.
 
 # Install
 
-go install github.com/fgergo/boringstreamer@latest
+    go install github.com/fgergo/boringstreamer@latest
 
 # Run
 
-$ boringstreamer
+    $ boringstreamer /path/to/music
 
-or
+or pipe an MP3 stream directly:
 
-c:\\>boringstreamer
+    $ cat file.mp3 | boringstreamer -
 
-then use chrome (or firefox etc.)  to listen to music.
+then open Chrome, Firefox, etc. to listen.
 
 # Help
 
 Use -h flag.
-
-# Bug
-
-A browser or player feature/bug:  Usually happens when boringstreamer streams
-different mp3s with different sample rates (e.g. 44100 and 48000). If the sample
-rate or bitrate or number of channels changes during playing, the player stops
-playing the stream. Boringstreamer handles the different files, but the players stop playing mp3s.
-
-Workaround 1: Refresh page in the browser when mp3 playing is stopped.
-
-Workaround 2: Change all mp3s to uniform format. Doesn't matter which format, it just should be uniform.
-For example with ffmpeg:
-
-	ffmpeg -i source.mp3 -vn -ar 44100 -ac 2 -ab 128 -f mp3 output.mp3

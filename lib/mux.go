@@ -85,7 +85,7 @@ func (m *mux) start(s *Streamer) *mux {
 			t0 := time.Now()
 			notified := false
 			filepath.Walk(path, func(wpath string, info os.FileInfo, err error) error {
-				// notify user if no audio files are found after 4 seconds of walking path recursively
+				// notify user if no audio files are found after 4 seconds of walking
 				dt := time.Now().Sub(t0)
 				if dt > 4*time.Second && !notified && s.Verbose {
 					fmt.Printf("Still looking for first audio file under %#v to broadcast, after %v... Maybe try -h flag.\n", path, dt)
@@ -95,11 +95,18 @@ func (m *mux) start(s *Streamer) *mux {
 				if err != nil {
 					return nil
 				}
+				// Honour -r=false: skip sub-directories that are not the root path.
+				if info.IsDir() {
+					if !s.Recursive && wpath != path {
+						return filepath.SkipDir
+					}
+					return nil
+				}
 				if !info.Mode().IsRegular() {
 					return nil
 				}
 				// skip files with no registered handler (audio or video)
-				if !info.IsDir() && contentTypeForFile(info.Name()) == "" {
+				if contentTypeForFile(info.Name()) == "" {
 					return nil
 				}
 

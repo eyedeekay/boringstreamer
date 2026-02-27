@@ -164,3 +164,27 @@ func TestInt16sToBytes(t *testing.T) {
 		t.Errorf("b[2:4]=0x%04X, want 0xFFFF (encoding of -1)", got)
 	}
 }
+
+// TestResampleDownsampleNoPanic exercises the 48000→44100 downsampling path
+// across a wide range of input lengths.  Before the lo-clamp fix, certain
+// lengths caused floating-point rounding to push lo to exactly len(src),
+// triggering an index-out-of-bounds panic.  This test simply verifies that
+// no panic occurs; output length is allowed to be 0 for very short inputs.
+func TestResampleDownsampleNoPanic(t *testing.T) {
+	// Run lengths from 1 to 1000; any panic will fail the test immediately.
+	for n := 1; n <= 1000; n++ {
+		src := make([]int16, n)
+		for i := range src {
+			src[i] = int16(i % 32767)
+		}
+		_ = resample(src, 48000, 44100) // must not panic
+	}
+}
+
+// TestResampleSingleSample ensures a one-element input does not panic.
+// For 48000→44100 a single sample rounds to 0 output samples (correct).
+func TestResampleSingleSample(t *testing.T) {
+	src := []int16{1000}
+	// Must not panic; empty result is acceptable for sub-threshold input.
+	_ = resample(src, 48000, 44100)
+}

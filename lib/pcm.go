@@ -27,6 +27,11 @@ func resample(src []int16, inRate, outRate int) []int16 {
 	for i := range out {
 		pos := float64(i) * float64(inRate) / float64(outRate)
 		lo := int(pos)
+		// Clamp lo: floating-point rounding during downsampling can push lo to
+		// exactly len(src), which would panic on the src[lo] access below.
+		if lo >= len(src) {
+			lo = len(src) - 1
+		}
 		hi := lo + 1
 		if hi >= len(src) {
 			hi = len(src) - 1
