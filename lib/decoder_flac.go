@@ -18,31 +18,31 @@ func init() {
 
 type flacDecoder struct{}
 
-// Decode decodes a FLAC stream into interleaved stereo int16 samples.
-// FLAC stores samples as int32 per channel; this function scales them to
-// 16-bit and interleaves across channels.
-func (flacDecoder) Decode(r io.Reader) ([]int16, int, int, error) {
+// OpenDecode opens a FLAC stream and returns the sample rate, channel count,
+// and a frame-by-frame iterator.  Each next() call parses one FLAC audio
+// frame and returns its interleaved int16 samples, scaled from the file's
+// native bit depth; it returns nil at EOF or on error.
+//
+// Peak memory: one FLAC frame at a time (typically 4096 samples/channel)
+// instead of the whole file.
+func (flacDecoder) OpenDecode(r io.Reader) (int, int, func() []int16, error) {
 	stream, err := flac.New(r)
 	if err != nil {
-		return nil, 0, 0, err
+		return 0, 0, nil, err
 	}
-	defer stream.Close()
 
 	sampleRate := int(stream.Info.SampleRate)
 	channels := int(stream.Info.NChannels)
 	bps := int(stream.Info.BitsPerSample)
 
-	var samples []int16
-	for {
+	next := func() []int16 {
 		f, err := stream.ParseNext()
-		if err == io.EOF {
-			break
-		}
 		if err != nil {
-			return nil, 0, 0, err
+			// io.EOF is the normal end-of-stream signal.
+			return nil
 		}
-
 		nSamples := len(f.Subframes[0].Samples)
+		out := make([]int16, nSamples*channels)
 		for i := 0; i < nSamples; i++ {
 			for c := 0; c < channels; c++ {
 				s32 := f.Subframes[c].Samples[i]
@@ -55,10 +55,10 @@ func (flacDecoder) Decode(r io.Reader) ([]int16, int, int, error) {
 				default:
 					s16 = int16(s32)
 				}
-				samples = append(samples, s16)
+				out[i*channels+c] = s16
 			}
 		}
+		return out
 	}
-
-	return samples, sampleRate, channels, nil
+	return sampleRate, channels, next, nil
 }

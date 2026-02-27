@@ -196,8 +196,10 @@ func (m *mux) start(s *Streamer) *mux {
 		}
 	}
 
-	// decodeFile decodes one audio file and sends its PCM chunks to nextFrame
-	// with appropriate pacing. It is called from separate goroutines below.
+	// decodeFile streams one audio file to nextFrame with appropriate pacing.
+	// It uses the AudioDecoder.OpenDecode iterator so only one small chunk of
+	// raw PCM (≈0.2 s) is resident in memory at a time, regardless of file
+	// size.  Normalisation and chunking are applied per-chunk before sending.
 	decodeFile := func(filename string, cumwait *time.Duration) {
 		dec := decoderForFile(filename)
 		if dec == nil {
@@ -212,7 +214,7 @@ func (m *mux) start(s *Streamer) *mux {
 		}
 		defer f.Close()
 
-		samples, rate, ch, err := dec.Decode(f)
+		rate, ch, next, err := dec.OpenDecode(f)
 		if err != nil {
 			if s.Debug {
 				log.Printf("Skipped %q: decode error: %v", filename, err)
@@ -223,25 +225,31 @@ func (m *mux) start(s *Streamer) *mux {
 			fmt.Printf("Now playing: %v\n", filename)
 		}
 
-		frames := chunk(normalise(samples, rate, ch), 8820)
-		for _, frame := range frames {
-			t0 := time.Now()
-			frameBytes := int16sToBytes(frame)
-			nextFrame <- frameBytes
-			// frame duration = samples / (channels * sample_rate)
-			towait := time.Duration(len(frameBytes))*time.Second/(2*2*canonRate) - time.Since(t0)
-			*cumwait += towait
-			if *cumwait > time.Second {
-				time.Sleep(*cumwait)
-				*cumwait = 0
+		for {
+			raw := next()
+			if raw == nil {
+				break
+			}
+			for _, frame := range chunk(normalise(raw, rate, ch), 8820) {
+				t0 := time.Now()
+				frameBytes := int16sToBytes(frame)
+				nextFrame <- frameBytes
+				// frame duration = samples / (channels * sample_rate)
+				towait := time.Duration(len(frameBytes))*time.Second/(2*2*canonRate) - time.Since(t0)
+				*cumwait += towait
+				if *cumwait > time.Second {
+					time.Sleep(*cumwait)
+					*cumwait = 0
+				}
 			}
 		}
 	}
 
-	// stdin path: decode the stream piped to standard input once, then loop
-	// the cached frames continuously.  Looping means clients that connect
-	// after stdin has been fully consumed still receive audio, matching the
-	// behaviour of the file-streamer path.
+	// stdin path: decode the stream piped to standard input once using the
+	// OpenDecode iterator so each chunk is processed as it is decoded rather
+	// than buffering the entire stdin first.  The resulting frames are cached
+	// in allFrames and then looped continuously so late-joining clients still
+	// receive audio.
 	//
 	// The format is determined by Streamer.StdinFormat (default "mp3").
 	go func() {
@@ -253,18 +261,27 @@ func (m *mux) start(s *Streamer) *mux {
 		m.Unlock()
 		// Normalise: strip any leading dot, lower-case, then re-add the dot so
 		// decoderForFile can match against registered extensions.
-		fmt := strings.ToLower(strings.TrimPrefix(s.StdinFormat, "."))
-		dec := decoderForFile("." + fmt)
+		stdinFmt := strings.ToLower(strings.TrimPrefix(s.StdinFormat, "."))
+		dec := decoderForFile("." + stdinFmt)
 		if dec == nil {
 			log.Printf("stdin: unknown format %q; set a supported format via Streamer.StdinFormat (e.g. \"mp3\" or \"flac\")", s.StdinFormat)
 			return
 		}
-		samples, rate, ch, err := dec.Decode(os.Stdin)
+		rate, ch, next, err := dec.OpenDecode(os.Stdin)
 		if err != nil {
 			log.Printf("stdin decode error: %v", err)
 			return
 		}
-		allFrames := chunk(normalise(samples, rate, ch), 8820)
+		var allFrames [][]byte
+		for {
+			raw := next()
+			if raw == nil {
+				break
+			}
+			for _, frame := range chunk(normalise(raw, rate, ch), 8820) {
+				allFrames = append(allFrames, int16sToBytes(frame))
+			}
+		}
 		if len(allFrames) == 0 {
 			return
 		}
@@ -272,9 +289,8 @@ func (m *mux) start(s *Streamer) *mux {
 		// silence after the single stdin read completes.
 		for {
 			var cumwait time.Duration
-			for _, frame := range allFrames {
+			for _, frameBytes := range allFrames {
 				t0 := time.Now()
-				frameBytes := int16sToBytes(frame)
 				nextFrame <- frameBytes
 				towait := time.Duration(len(frameBytes))*time.Second/(2*2*canonRate) - time.Since(t0)
 				cumwait += towait

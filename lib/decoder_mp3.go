@@ -19,24 +19,39 @@ func init() {
 
 type mp3Decoder struct{}
 
-// Decode decodes an MP3 stream into interleaved stereo int16 samples.
-// go-mp3 always produces stereo 16-bit little-endian PCM regardless of the
-// source channel count.
-func (mp3Decoder) Decode(r io.Reader) ([]int16, int, int, error) {
+// OpenDecode opens an MP3 stream and returns the sample rate, channel count
+// (always 2 for go-mp3), and an iterator that yields one read-buffer's worth
+// of raw stereo 16-bit samples per call.  next() returns nil when the stream
+// is exhausted.
+//
+// Peak memory: at most readBytes bytes per decode step instead of the whole
+// file.
+func (mp3Decoder) OpenDecode(r io.Reader) (int, int, func() []int16, error) {
 	d, err := mp3.NewDecoder(r)
 	if err != nil {
-		return nil, 0, 0, err
+		return 0, 0, nil, err
 	}
 
-	raw, err := io.ReadAll(d)
-	if err != nil {
-		return nil, 0, 0, err
-	}
+	// readBytes is one output frame of 8820 stereo pairs expressed as bytes.
+	// go-mp3 always outputs 16-bit little-endian stereo PCM.
+	const readBytes = 8820 * 2 * 2
+	buf := make([]byte, readBytes)
 
-	// go-mp3 produces 16-bit little-endian interleaved stereo PCM.
-	samples := make([]int16, len(raw)/2)
-	for i := range samples {
-		samples[i] = int16(binary.LittleEndian.Uint16(raw[i*2:]))
+	next := func() []int16 {
+		n, err := io.ReadFull(d, buf)
+		if n == 0 {
+			return nil
+		}
+		samples := make([]int16, n/2)
+		for i := range samples {
+			samples[i] = int16(binary.LittleEndian.Uint16(buf[i*2:]))
+		}
+		// io.ErrUnexpectedEOF means partial last read — valid final chunk.
+		// Any other error after reading data is treated as end-of-stream.
+		if err != nil && err != io.ErrUnexpectedEOF {
+			return nil
+		}
+		return samples
 	}
-	return samples, d.SampleRate(), 2, nil
+	return d.SampleRate(), 2, next, nil
 }

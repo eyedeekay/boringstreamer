@@ -7,11 +7,16 @@ import (
 	"strings"
 )
 
-// AudioDecoder decodes an audio file from r into raw PCM.
-// It returns interleaved signed 16-bit samples, the native sample rate,
-// the number of channels, and any error.
+// AudioDecoder progressively decodes audio from an io.Reader without
+// buffering the entire file in memory first.
+//
+// OpenDecode reads the file header and returns the native sample rate,
+// channel count, a next() iterator, and any error.  Each call to next()
+// returns the next chunk of raw interleaved signed 16-bit samples in the
+// file's native rate and layout, or nil when the stream is exhausted.
+// The caller is responsible for closing the underlying io.Reader.
 type AudioDecoder interface {
-	Decode(r io.Reader) (samples []int16, sampleRate int, channels int, err error)
+	OpenDecode(r io.Reader) (sampleRate int, channels int, next func() []int16, err error)
 }
 
 // audioFormat maps a lowercase file extension to a decoder.
