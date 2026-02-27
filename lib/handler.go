@@ -55,7 +55,12 @@ func (sh streamHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	result := make(chan error)
 	m := sync.Mutex{}
 	for {
-		buf := <-frames
+		// Use comma-ok so that a closed channel (mux cleaned up a zombie
+		// client) causes a clean exit rather than a silent nil-write loop.
+		buf, ok := <-frames
+		if !ok {
+			return
+		}
 
 		go func(r chan error, b []byte) {
 			m.Lock()

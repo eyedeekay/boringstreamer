@@ -224,7 +224,10 @@ func (m *mux) start(s *Streamer) *mux {
 		}
 	}
 
-	// stdin path: decode a single MP3 stream piped to standard input.
+	// stdin path: decode the MP3 stream piped to standard input once, then
+	// loop the cached frames continuously.  Looping means clients that
+	// connect after stdin has been fully consumed still receive audio,
+	// matching the behaviour of the file-streamer path.
 	go func() {
 		if path != "-" {
 			return
@@ -241,17 +244,24 @@ func (m *mux) start(s *Streamer) *mux {
 			log.Printf("stdin decode error: %v", err)
 			return
 		}
-		var cumwait time.Duration
-		frames := chunk(normalise(samples, rate, ch), 8820)
-		for _, frame := range frames {
-			t0 := time.Now()
-			frameBytes := int16sToBytes(frame)
-			nextFrame <- frameBytes
-			towait := time.Duration(len(frameBytes))*time.Second/(2*2*canonRate) - time.Since(t0)
-			cumwait += towait
-			if cumwait > time.Second {
-				time.Sleep(cumwait)
-				cumwait = 0
+		allFrames := chunk(normalise(samples, rate, ch), 8820)
+		if len(allFrames) == 0 {
+			return
+		}
+		// Loop forever so late-joining clients receive audio rather than
+		// silence after the single stdin read completes.
+		for {
+			var cumwait time.Duration
+			for _, frame := range allFrames {
+				t0 := time.Now()
+				frameBytes := int16sToBytes(frame)
+				nextFrame <- frameBytes
+				towait := time.Duration(len(frameBytes))*time.Second/(2*2*canonRate) - time.Since(t0)
+				cumwait += towait
+				if cumwait > time.Second {
+					time.Sleep(cumwait)
+					cumwait = 0
+				}
 			}
 		}
 	}()
