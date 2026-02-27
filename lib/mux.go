@@ -79,7 +79,8 @@ func (m *mux) start(s *Streamer) *mux {
 	nextFrame := make(chan streamFrame) // next audio or video chunk
 
 	// generate randomized list of files available from path
-	rand.Seed(time.Now().Unix()) // minimal randomness
+	// rand.Seed is omitted: Go 1.20+ automatically seeds the global source from
+	// OS entropy, making an explicit call a no-op and a go vet warning.
 	rescan := make(chan chan string)
 	go func() {
 		if path == "-" {
@@ -127,6 +128,19 @@ func (m *mux) start(s *Streamer) *mux {
 	}()
 
 	// buffer and shuffle
+	//
+	// Strategy: create a single 100 ms deadline before the walk begins.
+	// Files received before the deadline are buffered; once the deadline fires
+	// we flush the buffer in shuffled order and stream all subsequent files
+	// directly so playback starts as soon as possible on large libraries.
+	// Using a single pre-created timer (rather than time.After inside the loop)
+	// is the critical fix: a per-iteration time.After always produces a fresh,
+	// unready channel so the default case fires every time, making the early-
+	// start path permanently dead.
+	//
+	// The shuffle uses rand.Shuffle (Fisher-Yates) to produce a uniform random
+	// permutation. The previous insert-at-random-index algorithm could produce
+	// at most 2^(n-1) distinct orderings for n files instead of the required n!.
 	go func() {
 		if path == "-" {
 			return
@@ -136,33 +150,58 @@ func (m *mux) start(s *Streamer) *mux {
 			files := make(chan string)
 			rescan <- files
 
-			shuffled := make([]string, 0) // randomized set of files
+			var buffered []string
+			earlyDeadline := time.After(100 * time.Millisecond)
+			streaming := false // true once the early deadline has fired
 
 			for f := range files {
+				if streaming {
+					// Deadline already passed: forward directly for immediate playback.
+					nextFile <- fileEntry{Path: f, ContentType: contentTypeForFile(f)}
+					if s.Verbose {
+						fmt.Printf("Next: %v\n", f)
+					}
+					continue
+				}
+
+				// Check whether the 100 ms buffering window has elapsed.
 				select {
-				case <-time.After(100 * time.Millisecond): // start playing as soon as possible, but wait at least 0.1 second for shuffling
+				case <-earlyDeadline:
+					// Deadline just fired: shuffle and flush the buffer so
+					// playback can begin before the entire walk completes.
+					streaming = true
+					rand.Shuffle(len(buffered), func(i, j int) {
+						buffered[i], buffered[j] = buffered[j], buffered[i]
+					})
+					for _, sf := range buffered {
+						nextFile <- fileEntry{Path: sf, ContentType: contentTypeForFile(sf)}
+						if s.Verbose {
+							fmt.Printf("Next: %v\n", sf)
+						}
+					}
+					buffered = nil
+					// Forward the file that triggered the deadline too.
 					nextFile <- fileEntry{Path: f, ContentType: contentTypeForFile(f)}
 					if s.Verbose {
 						fmt.Printf("Next: %v\n", f)
 					}
 				default:
-					// shuffle files for random playback
-					// (random permutation)
-					if len(shuffled) == 0 {
-						shuffled = append(shuffled, f)
-					} else {
-						i := rand.Intn(len(shuffled))
-						shuffled = append(shuffled, shuffled[i])
-						shuffled[i] = f
-					}
+					// Still within the buffering window; accumulate for shuffle.
+					buffered = append(buffered, f)
 				}
 			}
 
-			// queue shuffled files
-			for _, f := range shuffled {
-				nextFile <- fileEntry{Path: f, ContentType: contentTypeForFile(f)}
-				if s.Verbose {
-					fmt.Printf("Next: %v\n", f)
+			// Walk complete. If the deadline never fired (fast walk or small
+			// library), shuffle and queue the full buffer now.
+			if !streaming {
+				rand.Shuffle(len(buffered), func(i, j int) {
+					buffered[i], buffered[j] = buffered[j], buffered[i]
+				})
+				for _, f := range buffered {
+					nextFile <- fileEntry{Path: f, ContentType: contentTypeForFile(f)}
+					if s.Verbose {
+						fmt.Printf("Next: %v\n", f)
+					}
 				}
 			}
 		}
