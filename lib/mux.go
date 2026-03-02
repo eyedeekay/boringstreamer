@@ -82,7 +82,7 @@ func (m *mux) subscribe(ch chan streamFrame, ct string) (int, chan broadcastResu
 	nClients := len(m.clients)
 	m.Unlock()
 	if m.streamer.Verbose {
-		fmt.Printf("New connection (qid: %v), streaming to %v connections, at %v\n", qid, nClients, time.Now().Format(time.Stamp))
+		log.Printf("New connection (qid: %v), streaming to %v connections, at %v", qid, nClients, time.Now().Format(time.Stamp))
 	}
 
 	return qid, m.result
@@ -153,7 +153,7 @@ func (m *mux) start(s *Streamer) *mux {
 				// notify user if no audio files are found after 4 seconds of walking
 				dt := time.Now().Sub(t0)
 				if dt > 4*time.Second && !notified && s.Verbose {
-					fmt.Printf("Still looking for first audio file under %#v to broadcast, after %v... Maybe try -h flag.\n", path, dt)
+					log.Printf("Still looking for first audio file under %#v to broadcast, after %v... Maybe try -h flag.", path, dt)
 					notified = true
 				}
 
@@ -233,14 +233,14 @@ func (m *mux) start(s *Streamer) *mux {
 					for _, sf := range buffered {
 						nextFile <- fileEntry{Path: sf, ContentType: contentTypeForFile(sf)}
 						if s.Verbose {
-							fmt.Printf("Next: %v\n", sf)
+							log.Printf("Next: %v", sf)
 						}
 					}
 					buffered = nil
 					// Forward the file that triggered the deadline too.
 					nextFile <- fileEntry{Path: f, ContentType: contentTypeForFile(f)}
 					if s.Verbose {
-						fmt.Printf("Next: %v\n", f)
+						log.Printf("Next: %v", f)
 					}
 				default:
 					// Still within the buffering window; accumulate for shuffle.
@@ -257,7 +257,7 @@ func (m *mux) start(s *Streamer) *mux {
 				for _, f := range buffered {
 					nextFile <- fileEntry{Path: f, ContentType: contentTypeForFile(f)}
 					if s.Verbose {
-						fmt.Printf("Next: %v\n", f)
+						log.Printf("Next: %v", f)
 					}
 				}
 			}
@@ -278,7 +278,7 @@ func (m *mux) start(s *Streamer) *mux {
 		}
 		defer f.Close()
 		if s.Verbose {
-			fmt.Printf("Now playing: %v\n", filename)
+			log.Printf("Now playing: %v", filename)
 		}
 		buf := make([]byte, 64*1024)
 		for {
@@ -320,7 +320,7 @@ func (m *mux) start(s *Streamer) *mux {
 			return
 		}
 		if s.Verbose {
-			fmt.Printf("Now playing: %v\n", filename)
+			log.Printf("Now playing: %v", filename)
 		}
 
 		for {
@@ -564,7 +564,7 @@ func (m *mux) start(s *Streamer) *mux {
 				if s.Debug {
 					log.Printf("Connection exited, qid: %v, error %v. Now streaming to %v connections.", br.qid, br.err, nclients)
 				} else if s.Verbose {
-					fmt.Printf("Connection exited, qid: %v. Now streaming to %v connections, at %v\n", br.qid, nclients, time.Now().Format(time.Stamp))
+					log.Printf("Connection exited, qid: %v. Now streaming to %v connections, at %v", br.qid, nclients, time.Now().Format(time.Stamp))
 				}
 			}
 		}

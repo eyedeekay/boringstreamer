@@ -83,14 +83,22 @@ func (s *Streamer) ListenAndServe(addr string) error {
 // Serve accepts connections on ln and streams audio to each client.
 // The listening address is retrieved from ln.Addr() and is used only for
 // informational log output; it is never stored as a string field.
+//
+// Serve validates the Streamer configuration before starting the HTTP server,
+// matching the guarantee provided by ListenAndServe. Callers who construct
+// their own net.Listener (e.g. TLS wrappers) receive the same early error
+// feedback rather than a silently broken stream.
 func (s *Streamer) Serve(ln net.Listener) error {
+	if err := s.validateConfig(); err != nil {
+		return err
+	}
 	if s.Debug {
 		go func() {
 			log.Println(http.ListenAndServe(":6060", nil))
 		}()
 	}
 	if s.Verbose {
-		fmt.Printf("Waiting for connections on %v\n", ln.Addr())
+		log.Printf("Waiting for connections on %v", ln.Addr())
 	}
 
 	s.server = &http.Server{

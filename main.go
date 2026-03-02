@@ -4,7 +4,6 @@ import (
 	"flag"
 	"fmt"
 	"os"
-	"path/filepath"
 
 	"github.com/fgergo/boringstreamer/lib"
 )
@@ -46,9 +45,12 @@ func main() {
 	}
 
 	// check if path is available
+	// os.Stat is used instead of filepath.Glob so that directory names
+	// containing glob metacharacters (e.g. "[AC/DC]", "Foo*", "What?") are
+	// treated as literal paths rather than shell patterns.
 	if path != "-" {
-		matches, err := filepath.Glob(path)
-		if err != nil || len(matches) < 1 {
+		_, err := os.Stat(path)
+		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error: \"%v\" unavailable, nothing to play.\n", path)
 			os.Exit(1)
 		}
