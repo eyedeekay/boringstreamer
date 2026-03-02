@@ -1,6 +1,7 @@
 package lib
 
 import (
+	"bytes"
 	"fmt"
 	"math/rand"
 	"sync"
@@ -636,6 +637,201 @@ func TestPacingStdinCumwaitClampedAtZero(t *testing.T) {
 				t.Errorf("cumwait went negative (%v); stdin pacing would flood clients", got)
 			}
 		})
+	}
+}
+
+// TestStdinLivePassthroughStreamsFramesBeforeEOF verifies the fix for AUDIT
+// FUNCTIONAL MISMATCH "Stdin Mode Buffers Complete Audio Before Starting
+// Playback".
+//
+// Old behavior: the stdin goroutine accumulated all decoded chunks in allFrames
+// before forwarding any to nextFrame, so clients heard silence until the entire
+// stdin stream had been consumed — potentially minutes for a large file.
+//
+// Fixed behavior (phase 1): each decoded frame is forwarded to nextFrame
+// immediately and also appended to allFrames for replay.  The pacing
+// logic (cumwait) runs in phase 1 so the stream is rate-controlled from
+// the very first frame.
+//
+// This test exercises the phase 1 loop logic directly — matching the
+// pattern used by TestPacingCumwaitClampedAtZero — and verifies:
+//  1. Every decoded chunk appears on nextFrame in decode order.
+//  2. allFrames contains the same data for the phase 2 replay loop.
+func TestStdinLivePassthroughStreamsFramesBeforeEOF(t *testing.T) {
+	// nextFrame is buffered so sends are non-blocking in this unit test.
+	nextFrame := make(chan streamFrame, 4)
+
+	// Two single-frame payloads at canonical frame size.
+	const nSamples = 8820
+	frame0 := make([]int16, nSamples)
+	frame1 := make([]int16, nSamples)
+	for i := range frame0 {
+		frame0[i] = int16(i)
+		frame1[i] = int16(i + 100)
+	}
+	rawChunks := [][]int16{frame0, frame1}
+	streamExhausted := false
+	calls := 0
+	next := func() []int16 {
+		if calls >= len(rawChunks) {
+			streamExhausted = true
+			return nil
+		}
+		r := rawChunks[calls]
+		calls++
+		return r
+	}
+
+	// Phase 1 loop — mirror of the fixed production code (pacing sleeps omitted;
+	// cumwait stays zero for frames that process faster than real-time in tests).
+	var allFrames [][]byte
+	var cumwait time.Duration
+	for {
+		raw := next()
+		if raw == nil {
+			break
+		}
+		for _, frame := range chunk(raw, nSamples) {
+			t0 := time.Now()
+			frameBytes := int16sToBytes(frame)
+			allFrames = append(allFrames, frameBytes)
+			nextFrame <- streamFrame{data: frameBytes, contentType: "audio/wav"}
+			towait := time.Duration(len(frameBytes))*time.Second/(2*2*canonRate) - time.Since(t0)
+			cumwait += towait
+			if cumwait < 0 {
+				cumwait = 0
+			}
+			if cumwait > time.Second {
+				time.Sleep(cumwait)
+				cumwait = 0
+			}
+		}
+	}
+
+	if !streamExhausted {
+		t.Fatal("next() was never exhausted; loop logic incorrect")
+	}
+
+	// Both frames must have been forwarded to nextFrame (phase 1, not phase 2).
+	if got := len(nextFrame); got != 2 {
+		t.Fatalf("nextFrame has %d frames after phase 1, want 2", got)
+	}
+
+	// Order must be preserved: frame0 first, frame1 second.
+	w0 := int16sToBytes(frame0)
+	w1 := int16sToBytes(frame1)
+	f0 := <-nextFrame
+	f1 := <-nextFrame
+	if !bytes.Equal(f0.data, w0) {
+		t.Error("phase 1: first frame content mismatch")
+	}
+	if !bytes.Equal(f1.data, w1) {
+		t.Error("phase 1: second frame content mismatch")
+	}
+
+	// allFrames must be populated so the phase 2 replay loop has data.
+	if len(allFrames) != 2 {
+		t.Fatalf("allFrames has %d entries after phase 1, want 2", len(allFrames))
+	}
+	if !bytes.Equal(allFrames[0], w0) || !bytes.Equal(allFrames[1], w1) {
+		t.Error("allFrames content does not match original frames; phase 2 replay would be corrupted")
+	}
+}
+
+// TestBroadcastDisconnectsMismatchedClientsOnContentTypeTransition verifies
+// the fix for AUDIT edge case bug "Audio Clients Stall Indefinitely When
+// Playlist Transitions to Video".
+//
+// Old behavior: when a video frame arrived the broadcast goroutine skipped
+// audio clients (ct mismatch) with a plain continue; sent==0 so no results
+// were collected and ServeHTTP's `<-frames` blocked indefinitely for the
+// entire duration of the video file — potentially hours.
+//
+// Fixed behavior: mismatched clients are collected in toDisconnect and passed
+// to m.unsubscribe after all matching dispatch goroutines are launched.
+// unsubscribe closes the frames channel; ServeHTTP sees ok==false on its
+// next `<-frames` receive and returns cleanly, allowing the browser to
+// reconnect with the new content type.
+func TestBroadcastDisconnectsMismatchedClientsOnContentTypeTransition(t *testing.T) {
+	const audioCT = "audio/wav"
+	const videoCT = "video/mp4"
+
+	s := &Streamer{MaxConnections: 3}
+	resultBuf := s.MaxConnections
+	m := &mux{
+		clients:  make(map[int]clientEntry),
+		result:   make(chan broadcastResult, resultBuf),
+		streamer: s,
+	}
+
+	// Subscribe one audio client (will become mismatched) and one video client.
+	audioCh := make(chan streamFrame)
+	videoCh := make(chan streamFrame, 1)
+	audioQID, _ := m.subscribe(audioCh, audioCT)
+	videoQID, _ := m.subscribe(videoCh, videoCT)
+	if audioQID < 0 || videoQID < 0 {
+		t.Fatal("subscribe rejected unexpectedly")
+	}
+
+	// Simulate one iteration of the fixed broadcast dispatch loop for a
+	// video frame.  Mirror of the production code in mux.go.
+	videoFrame := streamFrame{data: []byte("mp4 bytes"), contentType: videoCT}
+
+	m.Lock()
+	type clientSnap struct {
+		qid int
+		ch  chan streamFrame
+		ct  string
+	}
+	snap := make([]clientSnap, 0, len(m.clients))
+	for qid, e := range m.clients {
+		snap = append(snap, clientSnap{qid, e.ch, e.ct})
+	}
+	m.Unlock()
+
+	sent := 0
+	var toDisconnect []int
+	for _, e := range snap {
+		if e.ct != videoFrame.contentType {
+			toDisconnect = append(toDisconnect, e.qid)
+			continue
+		}
+		sent++
+		go func(ch chan streamFrame, frame streamFrame) {
+			ch <- frame
+		}(e.ch, videoFrame)
+	}
+	for _, qid := range toDisconnect {
+		m.unsubscribe(qid)
+	}
+
+	// Drain the video client (it was sent a frame).
+	if sent > 0 {
+		<-videoCh
+	}
+
+	// The audio client's frames channel must be closed so ServeHTTP can exit.
+	select {
+	case _, ok := <-audioCh:
+		if ok {
+			t.Error("audio client channel still open after video transition; ServeHTTP would stall")
+		}
+		// ok==false: unsubscribe closed the channel — correct behaviour.
+	case <-time.After(200 * time.Millisecond):
+		t.Error("audio client channel not closed within 200 ms; ServeHTTP would block indefinitely")
+	}
+
+	// The audio client must be removed from m.clients so the slot is reclaimed.
+	m.Lock()
+	_, audioStillPresent := m.clients[audioQID]
+	_, videoStillPresent := m.clients[videoQID]
+	m.Unlock()
+
+	if audioStillPresent {
+		t.Error("audio client still in m.clients after video transition; counts against MaxConnections")
+	}
+	if !videoStillPresent {
+		t.Error("video client was incorrectly removed from m.clients")
 	}
 }
 

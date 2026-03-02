@@ -350,11 +350,21 @@ func (m *mux) start(s *Streamer) *mux {
 		}
 	}
 
-	// stdin path: decode the stream piped to standard input once using the
-	// OpenDecode iterator so each chunk is processed as it is decoded rather
-	// than buffering the entire stdin first.  The resulting frames are cached
-	// in allFrames and then looped continuously so late-joining clients still
-	// receive audio.
+	// stdin path: decode the stream piped to standard input using the OpenDecode
+	// iterator.  Each decoded chunk is forwarded to nextFrame immediately (phase 1)
+	// so connecting clients hear audio within the first frame (~0.2 s) rather than
+	// waiting for the entire stdin to be consumed.  Frames are also appended to
+	// allFrames for the replay loop (phase 2) that keeps the server active after
+	// stdin is exhausted.
+	//
+	// Fix for AUDIT FUNCTIONAL MISMATCH "Stdin Mode Buffers Complete Audio Before
+	// Starting Playback": the previous implementation collected allFrames in full
+	// before entering the pacing loop, blocking all clients for the entire stdin
+	// decode duration.  For a 1-hour MP3 that could be several minutes of silence.
+	//
+	// Note: for infinite stdin streams (piped internet radio) phase 2 is never
+	// reached; allFrames grows proportionally to the stream duration but this is
+	// unavoidable when replay-after-reconnect is required.
 	//
 	// The format is determined by Streamer.StdinFormat (default "mp3").
 	go func() {
@@ -377,32 +387,47 @@ func (m *mux) start(s *Streamer) *mux {
 			log.Printf("stdin decode error: %v", err)
 			return
 		}
+
+		// Phase 1: live passthrough — send each frame to nextFrame as it is decoded
+		// and cache it for replay.  Clients connecting during this phase receive
+		// audio immediately without waiting for stdin to be fully consumed.
 		var allFrames [][]byte
+		var cumwait time.Duration
 		for {
 			raw := next()
 			if raw == nil {
 				break
 			}
 			for _, frame := range chunk(normalise(raw, rate, ch), 8820) {
-				allFrames = append(allFrames, int16sToBytes(frame))
+				t0 := time.Now()
+				frameBytes := int16sToBytes(frame)
+				allFrames = append(allFrames, frameBytes)
+				nextFrame <- streamFrame{data: frameBytes, contentType: "audio/wav"}
+				towait := time.Duration(len(frameBytes))*time.Second/(2*2*canonRate) - time.Since(t0)
+				cumwait += towait
+				if cumwait < 0 {
+					cumwait = 0
+				}
+				if cumwait > time.Second {
+					time.Sleep(cumwait)
+					cumwait = 0
+				}
 			}
 		}
 		if len(allFrames) == 0 {
 			return
 		}
-		// Loop forever so late-joining clients receive audio rather than
-		// silence after the single stdin read completes.
+		// Phase 2: replay — loop the cached frames so late-joining clients receive
+		// audio after stdin is exhausted.  For a finite stdin (e.g. a single file)
+		// this keeps the server active indefinitely.  For an infinite stdin this
+		// loop is never reached.
 		for {
-			var cumwait time.Duration
+			cumwait = 0
 			for _, frameBytes := range allFrames {
 				t0 := time.Now()
 				nextFrame <- streamFrame{data: frameBytes, contentType: "audio/wav"}
 				towait := time.Duration(len(frameBytes))*time.Second/(2*2*canonRate) - time.Since(t0)
 				cumwait += towait
-				// Clamp cumwait to zero when it goes negative. A large negative
-				// value (e.g. -44 s after a broadcastTimeout stall) would cause
-				// every subsequent frame to be sent without any sleep, flooding
-				// all remaining clients for an extended period.
 				if cumwait < 0 {
 					cumwait = 0
 				}
@@ -475,10 +500,21 @@ func (m *mux) start(s *Streamer) *mux {
 			// directory transitions from audio to video or vice versa.
 			// Every matching handler goroutine is independently waiting on its
 			// frames channel so all sends complete concurrently.
+			//
+			// Clients with a mismatched content type (e.g. an audio/wav client
+			// receiving a video frame) are disconnected immediately via
+			// unsubscribe so that ServeHTTP sees ok==false on its next <-frames
+			// receive and exits cleanly.  The browser then reconnects and
+			// receives the correct content type for the new medium.  Without
+			// this, audio clients stall indefinitely during video playback
+			// (AUDIT edge case bug "Audio Clients Stall Indefinitely When
+			// Playlist Transitions to Video").
 			sent := 0
+			var toDisconnect []int
 			for _, e := range snapshot {
 				if e.ct != f.contentType {
-					continue // skip clients expecting a different content type
+					toDisconnect = append(toDisconnect, e.qid)
+					continue
 				}
 				sent++
 				go func(qid int, ch chan streamFrame, frame streamFrame) {
@@ -498,6 +534,14 @@ func (m *mux) start(s *Streamer) *mux {
 					}()
 					ch <- frame
 				}(e.qid, e.ch, f)
+			}
+			// Disconnect mismatched clients after all matching dispatch goroutines
+			// are launched.  unsubscribe holds m.Lock itself and is safe to call
+			// here because no dispatch goroutine was spawned for these clients
+			// (they were skipped above), so there is no concurrent send to their
+			// channels that could race with the close inside unsubscribe.
+			for _, qid := range toDisconnect {
+				m.unsubscribe(qid)
 			}
 
 			// 3. Collect one result per client we actually sent to.  ServeHTTP
