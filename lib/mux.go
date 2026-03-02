@@ -416,6 +416,16 @@ func (m *mux) start(s *Streamer) *mux {
 			// any client blocking another.
 			for _, e := range snapshot {
 				go func(ch chan streamFrame, frame streamFrame) {
+					// Recover from a "send on closed channel" panic.  The race:
+					//   (a) ServeHTTP fails to write the WAV header and sends an
+					//       error result to m.result BEFORE entering the frame-
+					//       receive loop — so it never reads from ch.
+					//   (b) The broadcast goroutine reads that error result and
+					//       calls close(ch) to signal ServeHTTP to exit.
+					//   (c) This goroutine is still blocked on ch <- frame at
+					//       the moment of close(ch) and panics.
+					// recover() catches that panic so the server keeps running.
+					defer func() { recover() }() //nolint:errcheck
 					ch <- frame
 				}(e.ch, f)
 			}

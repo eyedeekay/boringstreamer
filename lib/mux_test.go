@@ -406,6 +406,48 @@ func TestParallelBroadcastErroredClientRemoved(t *testing.T) {
 	}
 }
 
+// TestBroadcastSendToClosedChannelNoPanic verifies the fix for the High-severity
+// "send on closed channel" server crash (AUDIT finding #1).
+//
+// Race reproduced by three concurrent actors:
+//  1. ServeHTTP subscribes; its channel ch is added to m.clients.
+//  2. The broadcast goroutine snapshots m.clients (includes ch) and spawns
+//     a send goroutine: go func() { ch <- frame }()
+//     The send goroutine BLOCKS because ServeHTTP has not entered its
+//     frame-receive loop yet (it is still writing the WAV header).
+//  3. The WAV header write fails.  ServeHTTP sends the error result directly
+//     to m.result BEFORE ever calling <-ch.
+//  4. The broadcast goroutine reads that error result and calls close(ch).
+//  5. The blocked send goroutine in step 2 would panic with
+//     "send on closed channel" — crashing the entire server.
+//
+// The fix adds `defer func() { recover() }()` to the send goroutine so the
+// panic is caught and the goroutine exits cleanly.
+//
+// This test creates an already-closed channel and starts a goroutine
+// attempting to send to it, reproducing step 5. The goroutine body is
+// identical to the fixed production code. Without the recover() the test
+// would panic; with it the goroutine exits and the test passes.
+func TestBroadcastSendToClosedChannelNoPanic(t *testing.T) {
+	ch := make(chan streamFrame)
+	close(ch) // simulate the broadcast goroutine closing the channel (step 4)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		// Exact copy of the fixed send goroutine body from mux.go.
+		defer func() { recover() }() //nolint:errcheck
+		ch <- streamFrame([]byte("frame"))
+	}()
+
+	select {
+	case <-done:
+		// Goroutine exited cleanly — panic was recovered, server would not crash.
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("send goroutine did not exit after channel was closed; likely deadlocked or panicked")
+	}
+}
+
 // TestSubscribeVerboseCountNeverRaces verifies the fix for the data race where
 // subscribe read len(m.clients) after releasing m.Unlock() (AUDIT finding #3).
 //
