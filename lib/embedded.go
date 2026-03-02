@@ -7,6 +7,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"strings"
 
 	_ "net/http/pprof" // imported for debug profiling endpoint
 )
@@ -47,9 +48,31 @@ func NewStreamer() *Streamer {
 	}
 }
 
+// validateConfig checks that the Streamer configuration is valid before the
+// server starts.  It returns a descriptive error for unsupported or
+// inconsistent settings so callers receive a clear message rather than a
+// silent runtime failure.
+//
+// Currently validates: when Path is "-", StdinFormat must name a registered
+// audio decoder (e.g. "mp3" or "flac").  An unrecognised format would cause
+// the stdin goroutine to exit silently, leaving the server running but
+// delivering silence to every connecting client.
+func (s *Streamer) validateConfig() error {
+	if s.Path == "-" {
+		stdinFmt := strings.ToLower(strings.TrimPrefix(s.StdinFormat, "."))
+		if decoderForFile("."+stdinFmt) == nil {
+			return fmt.Errorf("stdin: unknown format %q; supported audio formats: mp3, flac", s.StdinFormat)
+		}
+	}
+	return nil
+}
+
 // ListenAndServe opens a TCP listener on addr (e.g. ":4444") and then calls
 // Serve. It is a convenience wrapper around Serve for the common case.
 func (s *Streamer) ListenAndServe(addr string) error {
+	if err := s.validateConfig(); err != nil {
+		return err
+	}
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		return err

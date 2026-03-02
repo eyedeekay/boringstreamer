@@ -976,3 +976,55 @@ func TestCurrentContentTypeFallbackAfterTimeout(t *testing.T) {
 		t.Errorf("fallback = %q, want \"audio/wav\"", ct)
 	}
 }
+
+// TestValidateConfigRejectsUnknownStdinFormat verifies that ListenAndServe
+// returns an error immediately when Path=="-" and StdinFormat is not a
+// registered audio decoder extension.  This prevents the server from starting
+// and silently delivering a WAV header followed by no audio data.
+func TestValidateConfigRejectsUnknownStdinFormat(t *testing.T) {
+	for _, badFmt := range []string{"ogg", "wav", "flac2", "mp4", "", "xyz"} {
+		s := &Streamer{
+			Path:           "-",
+			StdinFormat:    badFmt,
+			MaxConnections: 1,
+		}
+		err := s.validateConfig()
+		if err == nil {
+			t.Errorf("validateConfig with StdinFormat=%q: want error, got nil", badFmt)
+		}
+	}
+}
+
+// TestValidateConfigAcceptsKnownStdinFormats verifies that validateConfig
+// passes for every registered audio format extension (e.g. "mp3", "flac"),
+// both with and without the leading dot, and case-insensitively.
+func TestValidateConfigAcceptsKnownStdinFormats(t *testing.T) {
+	for _, goodFmt := range []string{"mp3", "MP3", ".mp3", "flac", "FLAC", ".flac"} {
+		s := &Streamer{
+			Path:           "-",
+			StdinFormat:    goodFmt,
+			MaxConnections: 1,
+		}
+		err := s.validateConfig()
+		if err != nil {
+			t.Errorf("validateConfig with StdinFormat=%q: want nil error, got %v", goodFmt, err)
+		}
+	}
+}
+
+// TestValidateConfigNoopForFilePath verifies that validateConfig does not
+// inspect or reject StdinFormat when Path is not "-", so that file-system
+// mode deployments are unaffected by the stdin format field.
+func TestValidateConfigNoopForFilePath(t *testing.T) {
+	for _, badFmt := range []string{"ogg", "wav", "", "xyz"} {
+		s := &Streamer{
+			Path:           "/some/music/dir",
+			StdinFormat:    badFmt,
+			MaxConnections: 1,
+		}
+		err := s.validateConfig()
+		if err != nil {
+			t.Errorf("validateConfig with file path and StdinFormat=%q: want nil error, got %v", badFmt, err)
+		}
+	}
+}

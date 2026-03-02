@@ -37,7 +37,14 @@ func (mp3Decoder) OpenDecode(r io.Reader) (int, int, func() []int16, error) {
 	const readBytes = 8820 * 2 * 2
 	buf := make([]byte, readBytes)
 
+	// done is set when an unexpected IO error terminates the stream; subsequent
+	// next() calls return nil immediately so the decoder is not re-entered in an
+	// undefined state.
+	var done bool
 	next := func() []int16 {
+		if done {
+			return nil
+		}
 		n, err := io.ReadFull(d, buf)
 		if n == 0 {
 			return nil
@@ -46,14 +53,14 @@ func (mp3Decoder) OpenDecode(r io.Reader) (int, int, func() []int16, error) {
 		for i := range samples {
 			samples[i] = int16(binary.LittleEndian.Uint16(buf[i*2:]))
 		}
-		// io.ErrUnexpectedEOF means partial last read — valid final chunk.
-		// Any other non-nil error after a partial read: samples already contains
-		// valid decoded data so return them rather than silently discarding the
-		// last chunk.  This matches the ErrUnexpectedEOF handling above and
-		// ensures no samples are lost when an unexpected IO error terminates
-		// the stream (AUDIT: "MP3 Decoder Silently Drops Samples").
+		// io.ErrUnexpectedEOF means a partial final read — the samples are valid;
+		// fall through and return them normally.  Any other non-nil error signals
+		// an unexpected IO failure: return the partial samples accumulated so far
+		// (no data is silently discarded), then set done so the next call returns
+		// nil and terminates the decode loop cleanly instead of re-entering the
+		// decoder in an undefined state.
 		if err != nil && err != io.ErrUnexpectedEOF {
-			return samples
+			done = true
 		}
 		return samples
 	}
