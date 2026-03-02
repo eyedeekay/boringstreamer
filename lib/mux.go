@@ -216,7 +216,7 @@ func (m *mux) start(s *Streamer) *mux {
 					// Deadline already passed: forward directly for immediate playback.
 					nextFile <- fileEntry{Path: f, ContentType: contentTypeForFile(f)}
 					if s.Verbose {
-						fmt.Printf("Next: %v\n", f)
+						log.Printf("Next: %v", f)
 					}
 					continue
 				}
