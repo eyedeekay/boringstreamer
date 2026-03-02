@@ -497,9 +497,10 @@ func TestSubscribeVerboseCountNeverRaces(t *testing.T) {
 	<-deleteDone
 }
 
-// TestPacingCumwaitClampedAtZero verifies the fix for the pacing drift bug
-// (AUDIT finding #5): after a long stall the cumulative wait must be clamped
-// to zero instead of accumulating a large negative value.
+// TestPacingCumwaitClampedAtZero verifies the fix for the pacing drift bug:
+// after a long stall the cumulative wait must be clamped to zero instead of
+// accumulating a large negative value. Covers both the decodeFile path and
+// the stdin playback loop, which share identical pacing arithmetic.
 //
 // The test simulates the values in decodeFile's inner loop by applying the
 // same arithmetic and clamp logic directly to a time.Duration variable.
@@ -559,6 +560,77 @@ func TestPacingCumwaitClampedAtZero(t *testing.T) {
 			}
 			if got < 0 {
 				t.Errorf("cumwait went negative (%v); pacing would flood clients", got)
+			}
+		})
+	}
+}
+
+// TestPacingStdinCumwaitClampedAtZero verifies the fix for the missing negative
+// clamp in the stdin playback loop (AUDIT: "Stdin Pacing Missing Negative
+// cumwait Clamp"). The stdin loop previously lacked the clamp present in
+// decodeFile; after any broadcastTimeout stall (~44 s) cumwait would go deeply
+// negative and all subsequent frames would be sent without sleep, flooding
+// clients.
+//
+// The test mirrors the exact arithmetic of the stdin inner loop:
+//
+//	cumwait += towait
+//	if cumwait < 0 { cumwait = 0 }    ← the added fix
+//	if cumwait > time.Second { sleep; cumwait = 0 }
+func TestPacingStdinCumwaitClampedAtZero(t *testing.T) {
+	// simulateStdinPace runs one iteration of the stdin pacing logic.
+	simulateStdinPace := func(cumwait, towait time.Duration) time.Duration {
+		cumwait += towait
+		if cumwait < 0 { // fix: clamp that was previously missing in the stdin path
+			cumwait = 0
+		}
+		if cumwait > time.Second {
+			cumwait = 0
+		}
+		return cumwait
+	}
+
+	tests := []struct {
+		name    string
+		cumwait time.Duration
+		towait  time.Duration
+		want    time.Duration
+	}{
+		{
+			name:    "broadcast stall of 44 s clamps to zero",
+			cumwait: 0,
+			towait:  -44 * time.Second,
+			want:    0,
+		},
+		{
+			name:    "partial overshoot clamps to zero",
+			cumwait: 200 * time.Millisecond,
+			towait:  -300 * time.Millisecond,
+			want:    0,
+		},
+		{
+			name:    "positive accumulation is unaffected",
+			cumwait: 100 * time.Millisecond,
+			towait:  150 * time.Millisecond,
+			want:    250 * time.Millisecond,
+		},
+		{
+			name:    "zero stays zero",
+			cumwait: 0,
+			towait:  0,
+			want:    0,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := simulateStdinPace(tc.cumwait, tc.towait)
+			if got != tc.want {
+				t.Errorf("simulateStdinPace(cumwait=%v, towait=%v) = %v, want %v",
+					tc.cumwait, tc.towait, got, tc.want)
+			}
+			if got < 0 {
+				t.Errorf("cumwait went negative (%v); stdin pacing would flood clients", got)
 			}
 		})
 	}

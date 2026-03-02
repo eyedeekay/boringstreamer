@@ -348,6 +348,13 @@ func (m *mux) start(s *Streamer) *mux {
 				nextFrame <- frameBytes
 				towait := time.Duration(len(frameBytes))*time.Second/(2*2*canonRate) - time.Since(t0)
 				cumwait += towait
+				// Clamp cumwait to zero when it goes negative. A large negative
+				// value (e.g. -44 s after a broadcastTimeout stall) would cause
+				// every subsequent frame to be sent without any sleep, flooding
+				// all remaining clients for an extended period.
+				if cumwait < 0 {
+					cumwait = 0
+				}
 				if cumwait > time.Second {
 					time.Sleep(cumwait)
 					cumwait = 0
