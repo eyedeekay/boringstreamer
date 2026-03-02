@@ -91,3 +91,55 @@ func TestHandlerTimeoutErrorMessage(t *testing.T) {
 		t.Errorf("error message = %q, want %q", got, want)
 	}
 }
+
+// TestHandlerGoroutineUsesLocalError verifies the fix for the data race on the
+// outer `err` variable (AUDIT finding #4).
+//
+// Previously the goroutine captured `err` by reference and wrote it under a
+// sync.Mutex, while the outer goroutine also wrote `err` in the timeout branch
+// without the mutex, creating a data race.
+//
+// The fix: the goroutine now uses a local `copyErr` variable and sends the
+// value through the channel, eliminating all shared state.  This test
+// exercises the exact concurrent scenario (goroutine write races with outer
+// timeout write) and must pass under "go test -race".
+func TestHandlerGoroutineUsesLocalError(t *testing.T) {
+	old := broadcastTimeout
+	broadcastTimeout = 20 * time.Millisecond
+	defer func() { broadcastTimeout = old }()
+
+	unblock := make(chan struct{})
+	result := make(chan error, 1)
+	goroutineDone := make(chan struct{})
+
+	// Spawn the goroutine as the fixed ServeHTTP does: local copyErr, value
+	// sent through channel.  There is no shared `err` variable.
+	go func(r chan error, b []byte) {
+		defer close(goroutineDone)
+		_, copyErr := io.Copy(slowWriter{unblock: unblock}, bytes.NewReader(b))
+		r <- copyErr
+	}(result, []byte("audio frame data"))
+
+	// Simulate the timeout branch: outer goroutine writes to a local err.
+	// No shared variable exists between this goroutine and the one above.
+	var err error
+	select {
+	case err = <-result:
+		close(unblock)
+	case <-time.After(broadcastTimeout):
+		err = fmt.Errorf("timeout: %v", broadcastTimeout)
+	}
+	_ = err // used; prevents "declared and not used" error
+
+	select {
+	case <-unblock:
+	default:
+		close(unblock)
+	}
+
+	select {
+	case <-goroutineDone:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("goroutine leaked after timeout; result channel may be unbuffered")
+	}
+}

@@ -7,7 +7,6 @@ import (
 	"io"
 	"log"
 	"net/http"
-	"sync"
 	"time"
 )
 
@@ -61,7 +60,6 @@ func (sh streamHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// a timeout. An unbuffered channel here caused a goroutine leak: the
 	// io.Copy goroutine would block on the send indefinitely after a timeout.
 	result := make(chan error, 1)
-	m := sync.Mutex{}
 	for {
 		// Use comma-ok so that a closed channel (mux cleaned up a zombie
 		// client) causes a clean exit rather than a silent nil-write loop.
@@ -70,11 +68,14 @@ func (sh streamHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		// copyErr is local to the goroutine; it is never shared with the outer
+		// function.  The previous implementation captured the outer `err` by
+		// reference and wrote it under a sync.Mutex, but the outer goroutine
+		// also wrote `err` in the timeout branch without holding that mutex,
+		// producing a data race detected by -race.
 		go func(r chan error, b []byte) {
-			m.Lock()
-			_, err = io.Copy(w, bytes.NewReader(b))
-			m.Unlock()
-			r <- err
+			_, copyErr := io.Copy(w, bytes.NewReader(b))
+			r <- copyErr
 		}(result, buf)
 
 		select {

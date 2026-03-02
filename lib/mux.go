@@ -58,9 +58,13 @@ func (m *mux) subscribe(ch chan streamFrame) (int, chan broadcastResult) {
 		qid++
 	}
 	m.clients[qid] = ch
+	// Capture the current connection count while still holding the lock.
+	// Reading len(m.clients) after Unlock would race with the broadcast
+	// goroutine's lock-protected delete, causing a runtime panic under -race.
+	nClients := len(m.clients)
 	m.Unlock()
 	if m.streamer.Verbose {
-		fmt.Printf("New connection (qid: %v), streaming to %v connections, at %v\n", qid, len(m.clients), time.Now().Format(time.Stamp))
+		fmt.Printf("New connection (qid: %v), streaming to %v connections, at %v\n", qid, nClients, time.Now().Format(time.Stamp))
 	}
 
 	return qid, m.result
@@ -280,6 +284,13 @@ func (m *mux) start(s *Streamer) *mux {
 				// frame duration = samples / (channels * sample_rate)
 				towait := time.Duration(len(frameBytes))*time.Second/(2*2*canonRate) - time.Since(t0)
 				*cumwait += towait
+				// Clamp cumwait to zero when it goes negative. A large negative
+				// value (e.g. -44 s after a broadcastTimeout stall) would cause
+				// every subsequent frame to be sent without any sleep, flooding
+				// all remaining clients for hours before the deficit is repaid.
+				if *cumwait < 0 {
+					*cumwait = 0
+				}
 				if *cumwait > time.Second {
 					time.Sleep(*cumwait)
 					*cumwait = 0
