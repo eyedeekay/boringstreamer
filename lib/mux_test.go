@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"math/rand"
+	"net"
 	"sync"
 	"testing"
 	"time"
@@ -1026,5 +1027,28 @@ func TestValidateConfigNoopForFilePath(t *testing.T) {
 		if err != nil {
 			t.Errorf("validateConfig with file path and StdinFormat=%q: want nil error, got %v", badFmt, err)
 		}
+	}
+}
+
+// TestServeRejectsInvalidStdinFormat verifies that Serve() validates the
+// Streamer configuration and returns an error before accepting any connections
+// when Path=="-" and StdinFormat is unsupported.  Previously Serve() skipped
+// validateConfig(), silently starting a server that streamed only a WAV header
+// followed by silence.
+func TestServeRejectsInvalidStdinFormat(t *testing.T) {
+	s := &Streamer{
+		Path:           "-",
+		StdinFormat:    "ogg",
+		MaxConnections: 1,
+	}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.Listen: %v", err)
+	}
+	defer ln.Close()
+
+	err = s.Serve(ln)
+	if err == nil {
+		t.Fatal("Serve with invalid StdinFormat: want error, got nil")
 	}
 }
