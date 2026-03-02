@@ -53,7 +53,19 @@ func (sh streamHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if ct == "audio/wav" {
 		_, err = io.Copy(w, bytes.NewReader(wavHeader(44100, 2, 16)))
 		if err != nil {
-			br <- broadcastResult{qid, err}
+			// Remove this client directly from m.clients rather than sending
+			// via br (m.result).  The result channel is only read by the
+			// broadcast goroutine when it has dispatched a frame to at least
+			// one matching client (sent > 0).  When the broadcast goroutine is
+			// idle (empty directory, content-type mismatch) sent == 0 and a
+			// channel send would block forever, leaking this goroutine.
+			//
+			// unsubscribe closes the frames channel.  Any in-flight dispatch
+			// goroutine that panics on the closed send will report an error
+			// result itself (see mux.go dispatch goroutine), ensuring the
+			// broadcast goroutine's expected 'sent' count is satisfied.
+			// See: AUDIT edge case bug #4.
+			sh.unsubscribe(qid)
 			return
 		}
 	}
@@ -63,6 +75,13 @@ func (sh streamHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// a timeout. An unbuffered channel here caused a goroutine leak: the
 	// io.Copy goroutine would block on the send indefinitely after a timeout.
 	result := make(chan error, 1)
+	// Reuse a single timer per connection instead of allocating a new
+	// time.After on every frame iteration.  At ~5 frames/s each connection
+	// would otherwise create ~5 timers/s with a 44 s lifetime, holding
+	// ~220 live timers per client.  One timer per connection eliminates that
+	// GC pressure.  See: AUDIT performance issue #7.
+	timer := time.NewTimer(broadcastTimeout)
+	defer timer.Stop()
 	for {
 		// Use comma-ok so that a closed channel (mux cleaned up a zombie
 		// client) causes a clean exit rather than a silent nil-write loop.
@@ -82,13 +101,24 @@ func (sh streamHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			r <- copyErr
 		}(result, buf)
 
+		// Reset the timer for this frame's delivery window.  Stop+drain is
+		// required before Reset to avoid a spurious fire on iteration n+1
+		// caused by an unread tick from iteration n.
+		if !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
+			}
+		}
+		timer.Reset(broadcastTimeout)
+
 		select {
 		case err = <-result:
 			if err != nil {
 				break
 			}
 			br <- broadcastResult{qid, nil} // frame streamed, no error, send ack
-		case <-time.After(broadcastTimeout): // it's an error if io.Copy() is not finished within broadcastTimeout, ServeHTTP should exit
+		case <-timer.C: // it's an error if io.Copy() is not finished within broadcastTimeout, ServeHTTP should exit
 			err = fmt.Errorf("timeout: %v", broadcastTimeout)
 		}
 

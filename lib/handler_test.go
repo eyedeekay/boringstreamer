@@ -4,10 +4,22 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"sync"
 	"testing"
 	"time"
 )
+
+// failWriter is an http.ResponseWriter whose Write always returns an error.
+// It is used to simulate client disconnection during the WAV header write.
+type failWriter struct {
+	http.ResponseWriter
+}
+
+func (failWriter) Write(_ []byte) (int, error) {
+	return 0, fmt.Errorf("simulated write failure")
+}
 
 // slowWriter blocks every Write call until its unblock channel is closed.
 type slowWriter struct {
@@ -142,4 +154,128 @@ func TestHandlerGoroutineUsesLocalError(t *testing.T) {
 	case <-time.After(500 * time.Millisecond):
 		t.Fatal("goroutine leaked after timeout; result channel may be unbuffered")
 	}
+}
+
+// TestServeHTTPWAVHeaderFailureNoDeadlock is the regression test for AUDIT
+// edge case bug #4.
+//
+// When the WAV header write fails (e.g. the client disconnects immediately),
+// ServeHTTP must return promptly.  Before the fix, ServeHTTP sent its error
+// via the unbuffered m.result channel:
+//
+//	br <- broadcastResult{qid, err}
+//
+// The broadcast goroutine only reads from m.result while collecting results
+// after dispatching frames (sent > 0).  With an empty directory no frames are
+// ever dispatched, so sent == 0 permanently and the send blocked forever,
+// leaking the ServeHTTP goroutine and the m.clients entry.
+//
+// The fix has two parts:
+//  1. ServeHTTP calls sh.unsubscribe(qid) directly instead of sending via
+//     m.result, removing the client from the pool immediately.
+//  2. The dispatch goroutine reports a result via m.result when it recovers
+//     from a "send on closed channel" panic, keeping the broadcast goroutine's
+//     expected 'sent' count correct.
+//
+// This test starts a streamer pointing at a non-existent path (no frames ever
+// produced), connects a client whose WAV header write always fails, and asserts
+// that ServeHTTP exits within a generous deadline instead of hanging.
+func TestServeHTTPWAVHeaderFailureNoDeadlock(t *testing.T) {
+	s := &Streamer{
+		Path:           t.TempDir(), // empty directory — no frames ever produced
+		MaxConnections: 5,
+		Verbose:        false,
+	}
+	m := new(mux).start(s)
+
+	// Force the content type so currentContentType() returns immediately
+	// without sleeping through its 2 s polling window.
+	m.Lock()
+	m.currentCT = "audio/wav"
+	m.Unlock()
+
+	sh := streamHandler{m}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		rec := httptest.NewRecorder()
+		// failWriter overrides Write so the WAV header write returns an error,
+		// triggering the WAV header failure path in ServeHTTP.
+		sh.ServeHTTP(failWriter{rec}, httptest.NewRequest(http.MethodGet, "/", nil))
+	}()
+
+	select {
+	case <-done:
+		// ServeHTTP returned without blocking — fix verified.
+	case <-time.After(3 * time.Second):
+		t.Fatal("ServeHTTP deadlocked on WAV header failure (AUDIT bug #4): goroutine did not exit within 3 s")
+	}
+
+	// After ServeHTTP returns, the client must no longer be in m.clients.
+	// Give the unsubscribe a moment to complete (it runs synchronously, but
+	// the goroutine that called it may not have been scheduled yet).
+	time.Sleep(10 * time.Millisecond)
+	m.Lock()
+	nClients := len(m.clients)
+	m.Unlock()
+	if nClients != 0 {
+		t.Errorf("m.clients has %d entry/entries after WAV header failure, want 0 (client leaked)", nClients)
+	}
+}
+
+// TestServeHTTPTimerReusedAcrossFrames verifies that the single reused
+// time.Timer still correctly fires a timeout on a slow frame, guarding
+// against a regression in the Stop+Reset pattern introduced for AUDIT
+// performance issue #7.
+//
+// The test does not use a real mux; it replicates the timer logic directly
+// to keep the test fast and free of filesystem dependencies.
+func TestServeHTTPTimerReusedAcrossFrames(t *testing.T) {
+	old := broadcastTimeout
+	broadcastTimeout = 30 * time.Millisecond
+	defer func() { broadcastTimeout = old }()
+
+	result := make(chan error, 1)
+	unblock := make(chan struct{})
+
+	timer := time.NewTimer(broadcastTimeout)
+	defer timer.Stop()
+
+	// Simulate two frames being processed.  The first completes normally;
+	// the second is slow and should time out.
+	for i := range 2 {
+		// Reset timer exactly as handler.go does.
+		if !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
+			}
+		}
+		timer.Reset(broadcastTimeout)
+
+		if i == 0 {
+			// Fast frame: send result immediately.
+			result <- nil
+		}
+		// Slow frame (i == 1): nothing is sent to result; timer should fire.
+
+		var gotTimeout bool
+		select {
+		case err := <-result:
+			if err != nil {
+				t.Fatalf("frame %d: unexpected error %v", i, err)
+			}
+		case <-timer.C:
+			gotTimeout = true
+		}
+
+		if i == 0 && gotTimeout {
+			t.Fatal("frame 0: timed out unexpectedly on fast frame")
+		}
+		if i == 1 && !gotTimeout {
+			t.Fatal("frame 1: timer did not fire on slow frame; Reset+Stop pattern may be broken")
+		}
+	}
+	_ = unblock
 }

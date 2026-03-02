@@ -88,13 +88,44 @@ func (m *mux) subscribe(ch chan streamFrame, ct string) (int, chan broadcastResu
 	return qid, m.result
 }
 
+// unsubscribe removes the client identified by qid from the broadcast pool and
+// closes its frame channel.  It is safe to call from any goroutine and is
+// idempotent: a second call for the same qid is a no-op.
+//
+// ServeHTTP calls this directly when the WAV header write fails, BEFORE
+// entering the frame-receive loop.  Direct removal avoids DeadLock: without
+// this method ServeHTTP would send an error via m.result, which only works
+// when the broadcast goroutine is actively collecting results (sent > 0).  In
+// the empty-directory or content-type-mismatch case sent == 0 and the channel
+// send would block forever.  See: AUDIT edge case bug #4.
+func (m *mux) unsubscribe(qid int) {
+	m.Lock()
+	defer m.Unlock()
+	e, ok := m.clients[qid]
+	if !ok {
+		return
+	}
+	close(e.ch)
+	delete(m.clients, qid)
+}
+
 // start initializes a multiplexer for raw audio streams using the provided Streamer config.
 // e.g: m := new(mux).start(s)
 func (m *mux) start(s *Streamer) *mux {
 	m.streamer = s
 	path := s.Path
 
-	m.result = make(chan broadcastResult)
+	// Buffer capacity = MaxConnections so that ServeHTTP goroutines can
+	// always send a broadcastResult (success or error) without blocking, even
+	// when the broadcast goroutine is idle between frames or handling a
+	// content-type that does not match the failing client.  Without a buffer,
+	// the WAV header failure path in ServeHTTP deadlocks permanently.
+	// See: AUDIT issue #4.
+	resultBuf := s.MaxConnections
+	if resultBuf < 1 {
+		resultBuf = 1
+	}
+	m.result = make(chan broadcastResult, resultBuf)
 	m.clients = make(map[int]clientEntry)
 
 	// flow structure: fs -> nextFile -> nextFrame -> subscribed http servers -> browsers
@@ -450,19 +481,23 @@ func (m *mux) start(s *Streamer) *mux {
 					continue // skip clients expecting a different content type
 				}
 				sent++
-				go func(ch chan streamFrame, frame streamFrame) {
-					// Recover from a "send on closed channel" panic.  The race:
-					//   (a) ServeHTTP fails to write the WAV header and sends an
-					//       error result to m.result BEFORE entering the frame-
-					//       receive loop — so it never reads from ch.
-					//   (b) The broadcast goroutine reads that error result and
-					//       calls close(ch) to signal ServeHTTP to exit.
-					//   (c) This goroutine is still blocked on ch <- frame at
-					//       the moment of close(ch) and panics.
-					// recover() catches that panic so the server keeps running.
-					defer func() { recover() }() //nolint:errcheck
+				go func(qid int, ch chan streamFrame, frame streamFrame) {
+					// Recover from a "send on closed channel" panic.  This
+					// happens when ServeHTTP fails to write the WAV header and
+					// calls unsubscribe() which closes ch.  We send an error
+					// result to m.result so the broadcast goroutine's expected
+					// 'sent' count is always satisfied and it does not hang
+					// waiting for a result that ServeHTTP will never send.
+					// m.result is buffered so this send never blocks even when
+					// the broadcast goroutine has not yet entered its collect
+					// phase.  See: AUDIT edge case bug #4.
+					defer func() {
+						if r := recover(); r != nil {
+							m.result <- broadcastResult{qid, fmt.Errorf("channel closed: %v", r)}
+						}
+					}()
 					ch <- frame
-				}(e.ch, f)
+				}(e.qid, e.ch, f)
 			}
 
 			// 3. Collect one result per client we actually sent to.  ServeHTTP
