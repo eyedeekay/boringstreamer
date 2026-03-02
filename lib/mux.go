@@ -360,31 +360,74 @@ func (m *mux) start(s *Streamer) *mux {
 		}
 	}()
 
-	// broadcast frame to clients
+	// broadcast frame to clients in parallel.
+	//
+	// Each frame is dispatched to every subscribed client concurrently so that
+	// a single slow or stalled client cannot delay frame delivery to the rest.
+	// Delivery time per frame is O(max individual latency) instead of O(sum of
+	// latencies) as it was with the previous serial loop.
+	//
+	// Algorithm:
+	//   1. Snapshot m.clients under the lock, then release it before any
+	//      blocking sends so subscribe() is never blocked by a slow write.
+	//   2. Spawn one goroutine per client to send the frame; each goroutine
+	//      exits as soon as ServeHTTP reads the frame from its channel.
+	//   3. Wait for exactly len(snapshot) broadcastResult values to arrive on
+	//      m.result — ServeHTTP sends one after writing the chunk (or timing out).
+	//   4. Acquire the lock only to mutate m.clients for errored clients.
 	go func() {
+		type clientSnapshot struct {
+			qid int
+			ch  chan streamFrame
+		}
 		for {
 			f := <-nextFrame
-			// notify clients of new audio frame or let them quit
+
+			// 1. Snapshot the current client set.
 			m.Lock()
-			for _, ch := range m.clients {
-				m.Unlock()
-				ch <- f
-				br := <-m.result // handle quitting clients
-				if br.err != nil {
-					m.Lock()
-					close(m.clients[br.qid])
-					delete(m.clients, br.qid)
-					nclients := len(m.clients)
-					m.Unlock()
-					if s.Debug {
-						log.Printf("Connection exited, qid: %v, error %v. Now streaming to %v connections.", br.qid, br.err, nclients)
-					} else if s.Verbose {
-						fmt.Printf("Connection exited, qid: %v. Now streaming to %v connections, at %v\n", br.qid, nclients, time.Now().Format(time.Stamp))
-					}
-				}
-				m.Lock()
+			snapshot := make([]clientSnapshot, 0, len(m.clients))
+			for qid, ch := range m.clients {
+				snapshot = append(snapshot, clientSnapshot{qid, ch})
 			}
 			m.Unlock()
+
+			if len(snapshot) == 0 {
+				continue
+			}
+
+			// 2. Send the frame to all clients simultaneously.  Every handler
+			// goroutine is independently waiting on its frames channel so all
+			// sends complete as fast as the goroutine scheduler allows, without
+			// any client blocking another.
+			for _, e := range snapshot {
+				go func(ch chan streamFrame, frame streamFrame) {
+					ch <- frame
+				}(e.ch, f)
+			}
+
+			// 3. Collect one result per client.  ServeHTTP sends a
+			// broadcastResult after writing (nil error) or on timeout / network
+			// error (non-nil error).
+			for range snapshot {
+				br := <-m.result
+				if br.err == nil {
+					continue
+				}
+				// 4. Remove the failing client.  Guard with an existence check
+				// to handle the unlikely case of a duplicate error result.
+				m.Lock()
+				if _, ok := m.clients[br.qid]; ok {
+					close(m.clients[br.qid])
+					delete(m.clients, br.qid)
+				}
+				nclients := len(m.clients)
+				m.Unlock()
+				if s.Debug {
+					log.Printf("Connection exited, qid: %v, error %v. Now streaming to %v connections.", br.qid, br.err, nclients)
+				} else if s.Verbose {
+					fmt.Printf("Connection exited, qid: %v. Now streaming to %v connections, at %v\n", br.qid, nclients, time.Now().Format(time.Stamp))
+				}
+			}
 		}
 	}()
 

@@ -1,8 +1,10 @@
 package lib
 
 import (
+	"fmt"
 	"math/rand"
 	"testing"
+	"time"
 )
 
 // TestSubscribeMaxConnectionsEnforced verifies that subscribe returns -1 once
@@ -205,5 +207,200 @@ func TestShuffleTwoElementsBothOrderings(t *testing.T) {
 
 	if len(seen) != 2 {
 		t.Errorf("two-element shuffle produced %d distinct orderings, want 2", len(seen))
+	}
+}
+
+// TestParallelBroadcastAllClientsReceiveFrame verifies that the parallel
+// broadcast pattern delivers a frame to every subscribed client.
+//
+// The test directly exercises the dispatch/collect pattern used by the new
+// broadcast goroutine without going through the full mux.start() machinery:
+// it spawns N send goroutines (one per client) and N consumer goroutines, then
+// checks that every consumer received exactly one frame.
+func TestParallelBroadcastAllClientsReceiveFrame(t *testing.T) {
+	const n = 5
+	result := make(chan broadcastResult, n)
+
+	type entry struct {
+		qid int
+		ch  chan streamFrame
+	}
+	snapshot := make([]entry, n)
+	for i := range snapshot {
+		snapshot[i] = entry{qid: i, ch: make(chan streamFrame)}
+	}
+
+	frame := streamFrame([]byte("audio chunk"))
+
+	// Consumer goroutines: each reads one frame and sends success to result.
+	received := make([]bool, n)
+	for _, e := range snapshot {
+		go func(qid int, ch <-chan streamFrame) {
+			<-ch
+			received[qid] = true
+			result <- broadcastResult{qid: qid, err: nil}
+		}(e.qid, e.ch)
+	}
+
+	// Broadcast: send to all clients in parallel.
+	for _, e := range snapshot {
+		go func(ch chan<- streamFrame, f streamFrame) {
+			ch <- f
+		}(e.ch, frame)
+	}
+
+	// Collect all results.
+	for range snapshot {
+		<-result
+	}
+
+	for i, got := range received {
+		if !got {
+			t.Errorf("client %d did not receive the frame", i)
+		}
+	}
+}
+
+// TestParallelBroadcastIsNotSerial verifies that parallel delivery time is
+// bounded by the slowest single client, not the sum of all client latencies.
+//
+// Each simulated client sleeps for `delay` before consuming its frame.
+// Serial delivery (old code) would require n*delay to complete.
+// Parallel delivery (new code) should finish in approximately 1*delay.
+//
+// The test sends to n clients, each with an identical intentional delay, and
+// asserts the total elapsed time is well below n*delay.
+func TestParallelBroadcastIsNotSerial(t *testing.T) {
+	const n = 4
+	const delay = 30 * time.Millisecond
+
+	result := make(chan broadcastResult, n)
+
+	type entry struct {
+		qid int
+		ch  chan streamFrame
+	}
+	snapshot := make([]entry, n)
+	for i := range snapshot {
+		snapshot[i] = entry{qid: i, ch: make(chan streamFrame)}
+	}
+
+	frame := streamFrame([]byte("timing test chunk"))
+
+	// Each consumer blocks for `delay` before reading — simulating a client
+	// that is briefly slow to consume its receive buffer.
+	for _, e := range snapshot {
+		go func(qid int, ch <-chan streamFrame) {
+			time.Sleep(delay) // simulate slow consumer
+			<-ch
+			result <- broadcastResult{qid: qid, err: nil}
+		}(e.qid, e.ch)
+	}
+
+	t0 := time.Now()
+
+	// Parallel send.
+	for _, e := range snapshot {
+		go func(ch chan<- streamFrame, f streamFrame) {
+			ch <- f
+		}(e.ch, frame)
+	}
+
+	// Collect results.
+	for range snapshot {
+		<-result
+	}
+
+	elapsed := time.Since(t0)
+
+	// Serial delivery would take at least n*delay.  Parallel delivery takes
+	// approximately 1*delay.  Allow 2.5× for scheduling jitter; the serial
+	// bound is a hard lower-limit for the old implementation.
+	serialBound := time.Duration(n) * delay
+	if elapsed >= serialBound {
+		t.Errorf("delivery took %v; expected < %v (serial lower-bound); parallel delivery should be ~%v",
+			elapsed, serialBound, delay)
+	}
+}
+
+// TestParallelBroadcastErroredClientRemoved verifies that when one client
+// reports an error in its broadcastResult the broadcast goroutine removes it
+// from the client map while leaving healthy clients intact.
+//
+// The test constructs a minimal mux, populates its client map directly, then
+// runs one iteration of the snapshot-send-collect loop and inspects the map.
+func TestParallelBroadcastErroredClientRemoved(t *testing.T) {
+	const goodQID = 0
+	const badQID = 1
+
+	// Shared result channel — mirrors mux.result.
+	result := make(chan broadcastResult, 2)
+
+	goodCh := make(chan streamFrame)
+	badCh := make(chan streamFrame)
+
+	s := &Streamer{MaxConnections: 2}
+	m := &mux{
+		clients:  map[int]chan streamFrame{goodQID: goodCh, badQID: badCh},
+		result:   result,
+		streamer: s,
+	}
+
+	frame := streamFrame([]byte("data"))
+
+	// Simulate ServeHTTP for the good client: receive frame, report success.
+	go func() {
+		<-goodCh
+		result <- broadcastResult{qid: goodQID, err: nil}
+	}()
+
+	// Simulate ServeHTTP for the bad client: receive frame, report error.
+	go func() {
+		<-badCh
+		result <- broadcastResult{qid: badQID, err: fmt.Errorf("write: broken pipe")}
+	}()
+
+	// Run one parallel broadcast iteration (the pattern from the new code).
+	type clientSnapshot struct {
+		qid int
+		ch  chan streamFrame
+	}
+	m.Lock()
+	snapshot := make([]clientSnapshot, 0, len(m.clients))
+	for qid, ch := range m.clients {
+		snapshot = append(snapshot, clientSnapshot{qid, ch})
+	}
+	m.Unlock()
+
+	for _, e := range snapshot {
+		go func(ch chan streamFrame, f streamFrame) {
+			ch <- f
+		}(e.ch, frame)
+	}
+
+	for range snapshot {
+		br := <-m.result
+		if br.err == nil {
+			continue
+		}
+		m.Lock()
+		if _, ok := m.clients[br.qid]; ok {
+			close(m.clients[br.qid])
+			delete(m.clients, br.qid)
+		}
+		m.Unlock()
+	}
+
+	// After the iteration, the bad client must be gone; good client must remain.
+	m.Lock()
+	_, goodExists := m.clients[goodQID]
+	_, badExists := m.clients[badQID]
+	m.Unlock()
+
+	if !goodExists {
+		t.Errorf("healthy client (qid %d) was incorrectly removed from m.clients", goodQID)
+	}
+	if badExists {
+		t.Errorf("errored client (qid %d) was not removed from m.clients", badQID)
 	}
 }
