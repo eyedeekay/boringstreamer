@@ -3,6 +3,7 @@ package lib
 
 import (
 	"fmt"
+	"io/fs"
 	"log"
 	"math/rand"
 	"os"
@@ -92,7 +93,10 @@ func (m *mux) start(s *Streamer) *mux {
 
 			t0 := time.Now()
 			notified := false
-			filepath.Walk(path, func(wpath string, info os.FileInfo, err error) error {
+			// WalkDir is preferred over the deprecated filepath.Walk: it avoids a
+			// redundant os.Lstat call per directory entry and is measurably faster
+			// on large trees (available since Go 1.16).
+			filepath.WalkDir(path, func(wpath string, d fs.DirEntry, err error) error {
 				// notify user if no audio files are found after 4 seconds of walking
 				dt := time.Now().Sub(t0)
 				if dt > 4*time.Second && !notified && s.Verbose {
@@ -104,17 +108,17 @@ func (m *mux) start(s *Streamer) *mux {
 					return nil
 				}
 				// Honour -r=false: skip sub-directories that are not the root path.
-				if info.IsDir() {
+				if d.IsDir() {
 					if !s.Recursive && wpath != path {
 						return filepath.SkipDir
 					}
 					return nil
 				}
-				if !info.Mode().IsRegular() {
+				if !d.Type().IsRegular() {
 					return nil
 				}
 				// skip files with no registered handler (audio or video)
-				if contentTypeForFile(info.Name()) == "" {
+				if contentTypeForFile(d.Name()) == "" {
 					return nil
 				}
 
