@@ -23,6 +23,10 @@ func main() {
 		fmt.Printf("To stream from standard input: %v [-fmt mp3|flac] -\n\n", os.Args[0])
 		fmt.Println("flags:")
 		flag.PrintDefaults()
+		fmt.Println()
+		fmt.Printf("Developer flag (positional, must follow path):\n")
+		fmt.Printf("  -debug\tenable extra debug logging and pprof endpoint on :6060\n")
+		fmt.Printf("  Example: %v /path/to/music -debug\n", os.Args[0])
 	}
 	flag.Parse()
 	if len(flag.Args()) > 1 && flag.Args()[1] != "-debug" {
