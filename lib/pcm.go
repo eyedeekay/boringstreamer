@@ -16,6 +16,25 @@ func monoToStereo(src []int16) []int16 {
 	return out
 }
 
+// multiChanToStereo extracts the front-left (channel 0) and front-right
+// (channel 1) samples from a multi-channel interleaved PCM buffer and returns
+// them as an interleaved stereo slice.  For FLAC channel assignments the first
+// two channels are always front-left and front-right regardless of total channel
+// count (3.0, 4.0, 5.0, 5.1, 7.1, etc.).
+//
+// Channels beyond index 1 (centre, LFE, surround) are discarded rather than
+// mixed in, keeping the implementation simple and avoiding the level-
+// normalisation arithmetic that a full downmix would require.
+func multiChanToStereo(samples []int16, channels int) []int16 {
+	n := len(samples) / channels
+	out := make([]int16, n*2)
+	for i := 0; i < n; i++ {
+		out[i*2] = samples[i*channels]     // front-left
+		out[i*2+1] = samples[i*channels+1] // front-right
+	}
+	return out
+}
+
 // resample converts a single-channel PCM signal from inRate to outRate using
 // linear interpolation. Returns src unchanged when rates are equal.
 func resample(src []int16, inRate, outRate int) []int16 {
@@ -42,11 +61,17 @@ func resample(src []int16, inRate, outRate int) []int16 {
 	return out
 }
 
-// normalise converts arbitrary PCM (any sample rate, 1 or 2 channels) to the
+// normalise converts arbitrary PCM (any sample rate, 1–N channels) to the
 // canonical stream format: 44100 Hz, stereo, interleaved int16.
+// Mono input is duplicated to stereo.  Multi-channel (>2) input is reduced to
+// stereo by extracting the front-left and front-right channels (indices 0 and
+// 1); remaining channels are discarded.
 func normalise(samples []int16, sampleRate, channels int) []int16 {
-	if channels == 1 {
+	switch {
+	case channels == 1:
 		samples = monoToStereo(samples)
+	case channels > 2:
+		samples = multiChanToStereo(samples, channels)
 	}
 	if sampleRate == canonRate {
 		return samples

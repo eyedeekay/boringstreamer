@@ -188,3 +188,88 @@ func TestResampleSingleSample(t *testing.T) {
 	// Must not panic; empty result is acceptable for sub-threshold input.
 	_ = resample(src, 48000, 44100)
 }
+
+// TestMultiChanToStereoExtractsFirstTwoChannels verifies that multiChanToStereo
+// correctly de-interleaves a 6-channel (5.1) buffer and returns only the
+// front-left (index 0) and front-right (index 1) samples.  The centre,
+// LFE, and surround channels must be discarded.
+//
+// Layout for 6-channel FLAC per-frame:
+//
+//	[L0, R0, C0, LFE0, LS0, RS0, L1, R1, C1, LFE1, LS1, RS1, ...]
+func TestMultiChanToStereoExtractsFirstTwoChannels(t *testing.T) {
+	// Two frames: frame 0 and frame 1.
+	// channel order: L, R, C, LFE, LS, RS
+	src := []int16{
+		100, 200, 300, 400, 500, 600, // frame 0: L=100, R=200, others discarded
+		110, 220, 330, 440, 550, 660, // frame 1: L=110, R=220, others discarded
+	}
+	got := multiChanToStereo(src, 6)
+	want := []int16{100, 200, 110, 220}
+	if len(got) != len(want) {
+		t.Fatalf("multiChanToStereo len=%d, want %d", len(got), len(want))
+	}
+	for i, v := range want {
+		if got[i] != v {
+			t.Errorf("[%d] got %d, want %d", i, got[i], v)
+		}
+	}
+}
+
+// TestMultiChanToStereoThreeChannels verifies the 3.0 channel case (L, R, C).
+func TestMultiChanToStereoThreeChannels(t *testing.T) {
+	// Three frames, 3 channels each: L, R, C
+	src := []int16{
+		10, 20, 30, // frame 0
+		40, 50, 60, // frame 1
+	}
+	got := multiChanToStereo(src, 3)
+	want := []int16{10, 20, 40, 50}
+	if len(got) != len(want) {
+		t.Fatalf("multiChanToStereo len=%d, want %d", len(got), len(want))
+	}
+	for i, v := range want {
+		if got[i] != v {
+			t.Errorf("[%d] got %d, want %d", i, got[i], v)
+		}
+	}
+}
+
+// TestNormaliseMultiChannelAtCanonRate verifies that normalise correctly reduces
+// a 6-channel 44100 Hz input to stereo without resampling.  Before the fix,
+// normalise treated multi-channel input as already-stereo, interleaving pairs
+// from wrong channel positions and producing garbled output.
+func TestNormaliseMultiChannelAtCanonRate(t *testing.T) {
+	// Single frame, 6-channel 44100 Hz: L=1000, R=2000, C/LFE/LS/RS discarded.
+	src := []int16{1000, 2000, 3000, 4000, 5000, 6000}
+	got := normalise(src, canonRate, 6)
+	// Output must be exactly one stereo pair.
+	if len(got) != 2 {
+		t.Fatalf("normalise(6ch, canonRate) len=%d, want 2", len(got))
+	}
+	if got[0] != 1000 {
+		t.Errorf("left=%d, want 1000", got[0])
+	}
+	if got[1] != 2000 {
+		t.Errorf("right=%d, want 2000", got[1])
+	}
+}
+
+// TestNormaliseMultiChannelWithResample verifies that normalise can both
+// reduce channel count and resample in a single call.  Input is 3-channel
+// audio at 22050 Hz; output must be stereo at 44100 Hz.
+func TestNormaliseMultiChannelWithResample(t *testing.T) {
+	// Two frames of 3-channel 22050 Hz audio: L=0, R=1000, C discarded.
+	src := []int16{
+		0, 1000, 9999,
+		0, 1000, 9999,
+	}
+	got := normalise(src, 22050, 3)
+	// After downmix to stereo we have 2 frames; upsampling to 44100 gives ~4.
+	if len(got) < 4 {
+		t.Fatalf("expected at least 4 samples after resample, got %d", len(got))
+	}
+	if len(got)%2 != 0 {
+		t.Errorf("output length must be even (stereo pairs), got %d", len(got))
+	}
+}
