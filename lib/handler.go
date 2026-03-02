@@ -28,15 +28,18 @@ type streamHandler struct {
 // the client connects.
 func (sh streamHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	now := time.Now().UTC()
+	// Determine the content type BEFORE subscribing so the client entry in
+	// m.clients carries the correct type.  currentContentType() polls briefly
+	// for the first file's type so a video-first playlist does not cause a
+	// spurious WAV header to be written (AUDIT issue #4).
+	ct := sh.currentContentType()
 	frames := make(chan streamFrame)
-	qid, br := sh.subscribe(frames)
+	qid, br := sh.subscribe(frames, ct)
 	if qid < 0 {
 		log.Printf("Error: new connection request denied, already serving %v connections. See -h for details.", sh.streamer.MaxConnections)
 		w.WriteHeader(http.StatusTooManyRequests)
 		return
 	}
-
-	ct := sh.currentContentType()
 
 	w.Header().Set("Date", now.Format(http.TimeFormat))
 	w.Header().Set("Connection", "keep-alive")
@@ -63,10 +66,11 @@ func (sh streamHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	for {
 		// Use comma-ok so that a closed channel (mux cleaned up a zombie
 		// client) causes a clean exit rather than a silent nil-write loop.
-		buf, ok := <-frames
+		frame, ok := <-frames
 		if !ok {
 			return
 		}
+		buf := frame.data
 
 		// copyErr is local to the goroutine; it is never shared with the outer
 		// function.  The previous implementation captured the outer `err` by

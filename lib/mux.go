@@ -18,28 +18,46 @@ import (
 type mux struct {
 	sync.Mutex
 
-	clients   map[int]chan streamFrame // set of listener clients to be notified
-	result    chan broadcastResult     // clients share broadcast success-failure here
-	currentCT string                   // Content-Type of the currently streaming file
+	clients   map[int]clientEntry  // set of listener clients to be notified
+	result    chan broadcastResult // clients share broadcast success-failure here
+	currentCT string               // Content-Type of the currently streaming file
 	streamer  *Streamer
 }
 
 // currentContentType returns the HTTP Content-Type of the file currently
-// being streamed. It defaults to "audio/wav" before the first file starts.
+// being streamed. It polls briefly for the first file's content type so that
+// clients connecting before playback begins get the correct type rather than
+// the wrong "audio/wav" default. This matters when the first shuffled file
+// is a video: without the poll a connecting client would receive a stray WAV
+// header followed by raw video container bytes.
+//
+// polling timeout: 20 × 100 ms = 2 s. In the normal case (files found quickly)
+// the first content type is set within the 100 ms buffering window.
 func (m *mux) currentContentType() string {
-	m.Lock()
-	ct := m.currentCT
-	m.Unlock()
-	if ct == "" {
-		return "audio/wav"
+	const (
+		pollInterval = 100 * time.Millisecond
+		pollAttempts = 20
+	)
+	for i := 0; i < pollAttempts; i++ {
+		m.Lock()
+		ct := m.currentCT
+		m.Unlock()
+		if ct != "" {
+			return ct
+		}
+		time.Sleep(pollInterval)
 	}
-	return ct
+	// Nothing has started within the polling window (e.g. empty directory).
+	// Fall back to audio/wav so audio-only deployments remain unaffected.
+	return "audio/wav"
 }
 
-// subscribe adds ch to the set of channels to be received on by the clients when a new audio frame is available.
+// subscribe registers ch as a recipient of frames with the given content type.
+// Only frames whose content type matches ct are delivered to ch, preventing
+// raw video bytes from being injected into an audio stream and vice versa.
 // Returns unique client id (qid) for ch and a broadcast result channel for the client.
 // Returns -1, nil if too many clients are already listening.
-func (m *mux) subscribe(ch chan streamFrame) (int, chan broadcastResult) {
+func (m *mux) subscribe(ch chan streamFrame, ct string) (int, chan broadcastResult) {
 	m.Lock()
 	// Reject immediately when at or above capacity.  Using len(m.clients) makes
 	// the capacity check O(1) and handles all boundary values of MaxConnections
@@ -57,7 +75,7 @@ func (m *mux) subscribe(ch chan streamFrame) (int, chan broadcastResult) {
 		}
 		qid++
 	}
-	m.clients[qid] = ch
+	m.clients[qid] = clientEntry{ch: ch, ct: ct}
 	// Capture the current connection count while still holding the lock.
 	// Reading len(m.clients) after Unlock would race with the broadcast
 	// goroutine's lock-protected delete, causing a runtime panic under -race.
@@ -77,7 +95,7 @@ func (m *mux) start(s *Streamer) *mux {
 	path := s.Path
 
 	m.result = make(chan broadcastResult)
-	m.clients = make(map[int]chan streamFrame)
+	m.clients = make(map[int]clientEntry)
 
 	// flow structure: fs -> nextFile -> nextFrame -> subscribed http servers -> browsers
 	nextFile := make(chan fileEntry)    // next file to be broadcast (with its Content-Type)
@@ -215,9 +233,11 @@ func (m *mux) start(s *Streamer) *mux {
 		}
 	}()
 
-	// streamVideoFile pipes a video file directly to nextFrame in 64 KiB chunks.
+	// streamVideoFile pipes a video file directly to nextFrame in 64 KiB chunks,
+	// tagging each chunk with ct so the broadcast goroutine only delivers it to
+	// clients that subscribed for that video content type.
 	// No timing is applied; the browser's media pipeline handles buffering.
-	streamVideoFile := func(filename string) {
+	streamVideoFile := func(filename string, ct string) {
 		f, err := os.Open(filename)
 		if err != nil {
 			if s.Debug {
@@ -235,7 +255,7 @@ func (m *mux) start(s *Streamer) *mux {
 			if n > 0 {
 				chunk := make([]byte, n)
 				copy(chunk, buf[:n])
-				nextFrame <- chunk
+				nextFrame <- streamFrame{data: chunk, contentType: ct}
 			}
 			if err != nil {
 				break
@@ -280,7 +300,7 @@ func (m *mux) start(s *Streamer) *mux {
 			for _, frame := range chunk(normalise(raw, rate, ch), 8820) {
 				t0 := time.Now()
 				frameBytes := int16sToBytes(frame)
-				nextFrame <- frameBytes
+				nextFrame <- streamFrame{data: frameBytes, contentType: "audio/wav"}
 				// frame duration = samples / (channels * sample_rate)
 				towait := time.Duration(len(frameBytes))*time.Second/(2*2*canonRate) - time.Since(t0)
 				*cumwait += towait
@@ -345,7 +365,7 @@ func (m *mux) start(s *Streamer) *mux {
 			var cumwait time.Duration
 			for _, frameBytes := range allFrames {
 				t0 := time.Now()
-				nextFrame <- frameBytes
+				nextFrame <- streamFrame{data: frameBytes, contentType: "audio/wav"}
 				towait := time.Duration(len(frameBytes))*time.Second/(2*2*canonRate) - time.Since(t0)
 				cumwait += towait
 				// Clamp cumwait to zero when it goes negative. A large negative
@@ -377,7 +397,7 @@ func (m *mux) start(s *Streamer) *mux {
 			if entry.ContentType == "audio/wav" {
 				decodeFile(entry.Path, &cumwait)
 			} else {
-				streamVideoFile(entry.Path)
+				streamVideoFile(entry.Path, entry.ContentType)
 			}
 		}
 	}()
@@ -401,6 +421,7 @@ func (m *mux) start(s *Streamer) *mux {
 		type clientSnapshot struct {
 			qid int
 			ch  chan streamFrame
+			ct  string // expected content type for this client
 		}
 		for {
 			f := <-nextFrame
@@ -408,8 +429,8 @@ func (m *mux) start(s *Streamer) *mux {
 			// 1. Snapshot the current client set.
 			m.Lock()
 			snapshot := make([]clientSnapshot, 0, len(m.clients))
-			for qid, ch := range m.clients {
-				snapshot = append(snapshot, clientSnapshot{qid, ch})
+			for qid, e := range m.clients {
+				snapshot = append(snapshot, clientSnapshot{qid, e.ch, e.ct})
 			}
 			m.Unlock()
 
@@ -417,11 +438,18 @@ func (m *mux) start(s *Streamer) *mux {
 				continue
 			}
 
-			// 2. Send the frame to all clients simultaneously.  Every handler
-			// goroutine is independently waiting on its frames channel so all
-			// sends complete as fast as the goroutine scheduler allows, without
-			// any client blocking another.
+			// 2. Send the frame only to clients whose expected content type
+			// matches this frame's content type.  This prevents raw video bytes
+			// from being injected into an audio stream when a mixed-content
+			// directory transitions from audio to video or vice versa.
+			// Every matching handler goroutine is independently waiting on its
+			// frames channel so all sends complete concurrently.
+			sent := 0
 			for _, e := range snapshot {
+				if e.ct != f.contentType {
+					continue // skip clients expecting a different content type
+				}
+				sent++
 				go func(ch chan streamFrame, frame streamFrame) {
 					// Recover from a "send on closed channel" panic.  The race:
 					//   (a) ServeHTTP fails to write the WAV header and sends an
@@ -437,10 +465,10 @@ func (m *mux) start(s *Streamer) *mux {
 				}(e.ch, f)
 			}
 
-			// 3. Collect one result per client.  ServeHTTP sends a
-			// broadcastResult after writing (nil error) or on timeout / network
-			// error (non-nil error).
-			for range snapshot {
+			// 3. Collect one result per client we actually sent to.  ServeHTTP
+			// sends a broadcastResult after writing (nil error) or on timeout /
+			// network error (non-nil error).
+			for i := 0; i < sent; i++ {
 				br := <-m.result
 				if br.err == nil {
 					continue
@@ -449,7 +477,7 @@ func (m *mux) start(s *Streamer) *mux {
 				// to handle the unlikely case of a duplicate error result.
 				m.Lock()
 				if _, ok := m.clients[br.qid]; ok {
-					close(m.clients[br.qid])
+					close(m.clients[br.qid].ch)
 					delete(m.clients, br.qid)
 				}
 				nclients := len(m.clients)

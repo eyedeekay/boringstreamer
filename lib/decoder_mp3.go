@@ -47,9 +47,13 @@ func (mp3Decoder) OpenDecode(r io.Reader) (int, int, func() []int16, error) {
 			samples[i] = int16(binary.LittleEndian.Uint16(buf[i*2:]))
 		}
 		// io.ErrUnexpectedEOF means partial last read — valid final chunk.
-		// Any other error after reading data is treated as end-of-stream.
+		// Any other non-nil error after a partial read: samples already contains
+		// valid decoded data so return them rather than silently discarding the
+		// last chunk.  This matches the ErrUnexpectedEOF handling above and
+		// ensures no samples are lost when an unexpected IO error terminates
+		// the stream (AUDIT: "MP3 Decoder Silently Drops Samples").
 		if err != nil && err != io.ErrUnexpectedEOF {
-			return nil
+			return samples
 		}
 		return samples
 	}

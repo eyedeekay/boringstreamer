@@ -9,7 +9,21 @@ func (nw nullWriter) Write(p []byte) (n int, err error) {
 }
 
 // streamFrame represents a single audio or video chunk to be broadcast.
-type streamFrame []byte
+// Each frame carries its content type so the broadcast goroutine can route
+// frames only to clients that subscribed for that content type.
+type streamFrame struct {
+	data        []byte
+	contentType string
+}
+
+// clientEntry pairs a client's frame channel with the content type that client
+// expects.  The broadcast goroutine skips sending a frame to a client whose
+// expected content type does not match the frame's content type, preventing
+// raw video bytes from being injected into an audio stream and vice versa.
+type clientEntry struct {
+	ch chan streamFrame
+	ct string // expected content type for this connection
+}
 
 // broadcastResult represents a client's event after attempting to broadcast a frame.
 type broadcastResult struct {
